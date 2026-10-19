@@ -70,7 +70,7 @@ fn upload_to_target_replays_headers_for_byte_uploads() {
             .with_status(200)
             .create();
 
-        let client = http_client::Client::new_external();
+        let client = crate::server::server_api::ServerApi::new_for_test();
         let target = UploadTarget {
             url: format!(
                 "{}/upload?X-Amz-Signature=test%2Bsignature&x-id=PutObject",
@@ -116,7 +116,7 @@ fn upload_file_to_target_replays_headers_sets_content_length_and_returns_checksu
         .with_status(200)
         .create();
 
-    let client = http_client::Client::new_for_test();
+    let client = crate::server::server_api::ServerApi::new_for_test();
     let target = FileArtifactUploadTargetInfo {
         url: format!("{}/upload", server.url()),
         method: "POST".to_string(),
@@ -152,7 +152,7 @@ fn upload_file_to_target_returns_status_and_body_for_failed_uploads() {
         .with_body("denied")
         .create();
 
-    let client = http_client::Client::new_for_test();
+    let client = crate::server::server_api::ServerApi::new_for_test();
     let target = FileArtifactUploadTargetInfo {
         url: format!("{}/upload", server.url()),
         method: "PUT".to_string(),
@@ -212,7 +212,7 @@ fn upload_to_target_builds_multipart_post_with_static_crc_and_data_fields() {
             .with_status(204)
             .create();
 
-        let client = http_client::Client::new_for_test();
+        let client = crate::server::server_api::ServerApi::new_for_test();
         let target = UploadTarget {
             url: format!("{}/upload", server.url()),
             method: "POST".to_string(),
@@ -304,7 +304,7 @@ fn upload_file_to_target_builds_multipart_post_and_returns_computed_crc32c() {
         .with_status(204)
         .create();
 
-    let client = http_client::Client::new_for_test();
+    let client = crate::server::server_api::ServerApi::new_for_test();
     let target = FileArtifactUploadTargetInfo {
         url: format!("{}/upload", server.url()),
         method: "POST".to_string(),

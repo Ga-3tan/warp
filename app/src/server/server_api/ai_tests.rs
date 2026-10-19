@@ -1862,7 +1862,7 @@ fn upload_first_attachment(body: &str, upload_url: &str) {
     let target = response.attachments[0].resolve_upload_target("image/png");
 
     block_on(upload_to_target(
-        &http_client::Client::new_for_test(),
+        &crate::server::server_api::ServerApi::new_for_test(),
         &target,
         b"attachment bytes".to_vec(),
     ))

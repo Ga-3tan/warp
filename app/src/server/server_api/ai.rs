@@ -3285,20 +3285,14 @@ impl AIClient for ServerApi {
         conversation_id: &str,
         screenshot_uid: &str,
     ) -> anyhow::Result<Bytes, anyhow::Error> {
-        // The endpoint redirects to a short-lived signed URL, which the HTTP
-        // client follows transparently. Strip that URL from body-read errors so
-        // it cannot leak into logs or Sentry breadcrumbs.
-        let response = self
-            .get_public_api_response(&format!(
-                "agent/conversations/{}/screenshots/{}/download",
+        self.base_client
+            .download_presigned(&format!(
+                "{}/api/v1/agent/conversations/{}/screenshots/{}/download",
+                ChannelState::server_root_url(),
                 urlencoding::encode(conversation_id),
                 urlencoding::encode(screenshot_uid)
             ))
-            .await?;
-        response
-            .bytes()
             .await
-            .map_err(|error| anyhow::Error::new(error.without_url()))
     }
 
     async fn prepare_attachments_for_upload(
@@ -3363,10 +3357,11 @@ impl AIClient for ServerApi {
         &self,
         run_id: &AmbientAgentTaskId,
     ) -> anyhow::Result<Bytes, anyhow::Error> {
-        let response = self
-            .get_public_api_response(&format!("agent/runs/{run_id}/transcript"))
-            .await?;
-        Ok(response.bytes().await?)
+        self.download_presigned(&format!(
+            "{}/api/v1/agent/runs/{run_id}/transcript",
+            ChannelState::server_root_url()
+        ))
+        .await
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -3376,7 +3371,10 @@ impl AIClient for ServerApi {
         destination: &Path,
     ) -> anyhow::Result<(), anyhow::Error> {
         let response = self
-            .get_public_api_response(&format!("agent/runs/{run_id}/transcript"))
+            .download_storage_response(&format!(
+                "{}/api/v1/agent/runs/{run_id}/transcript",
+                ChannelState::server_root_url()
+            ))
             .await?;
         write_response_body_to_path(response, destination).await
     }
@@ -3386,10 +3384,12 @@ impl AIClient for ServerApi {
         &self,
         conversation_id: &str,
     ) -> anyhow::Result<Bytes, anyhow::Error> {
-        let response = self
-            .get_public_api_response(&format!("agent/conversations/{conversation_id}/transcript"))
-            .await?;
-        Ok(response.bytes().await?)
+        self.download_presigned(&format!(
+            "{}/api/v1/agent/conversations/{}/transcript",
+            ChannelState::server_root_url(),
+            urlencoding::encode(conversation_id)
+        ))
+        .await
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -3399,7 +3399,11 @@ impl AIClient for ServerApi {
         destination: &Path,
     ) -> anyhow::Result<(), anyhow::Error> {
         let response = self
-            .get_public_api_response(&format!("agent/conversations/{conversation_id}/transcript"))
+            .download_storage_response(&format!(
+                "{}/api/v1/agent/conversations/{}/transcript",
+                ChannelState::server_root_url(),
+                urlencoding::encode(conversation_id)
+            ))
             .await?;
         write_response_body_to_path(response, destination).await
     }

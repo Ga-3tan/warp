@@ -2932,7 +2932,7 @@ impl ServerModel {
 
         let server_api = ServerApiProvider::handle(ctx);
         let ai_client = server_api.as_ref(ctx).get_ai_client();
-        let http = server_api.as_ref(ctx).get_http_client();
+        let http = server_api.as_ref(ctx).get();
 
         // Convert proto strings → StandardizedPath at the boundary; invalid
         // entries are logged and dropped.

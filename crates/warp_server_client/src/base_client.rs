@@ -132,6 +132,7 @@ enum AmbientIdentity {
 pub struct BaseClient {
     client: Arc<http_client::Client>,
     external_client: Arc<http_client::Client>,
+    storage_client: http_client::Client,
     auth_state: Arc<AuthState>,
     event_sender: async_channel::Sender<AuthEvent>,
     auth_session: Arc<AuthSession>,
@@ -189,9 +190,16 @@ impl BaseClient {
             auth_state.clone(),
             event_sender.clone(),
         ));
+        #[cfg_attr(target_family = "wasm", expect(unused_mut))]
+        let mut storage_client = http_client::Client::new_storage_transfer();
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(provider) = &iap_token_provider {
+            storage_client.set_iap_token_provider(provider.clone());
+        }
         Self {
             client,
             external_client,
+            storage_client,
             auth_state,
             event_sender,
             auth_session,
@@ -231,6 +239,39 @@ impl BaseClient {
     /// Returns the pooled external HTTP client.
     pub fn external_http_client(&self) -> &http_client::Client {
         self.external_client.as_ref()
+    }
+
+    /// Builds a transfer request, authenticating only the exact Warp server origin.
+    pub async fn storage_request(
+        &self,
+        method: http::Method,
+        url: &str,
+    ) -> Result<http_client::RequestBuilder<'_>> {
+        let url = reqwest::Url::parse(url).context("Invalid storage transfer URL")?;
+        let server =
+            reqwest::Url::parse(warp_core::channel::ChannelState::server_root_url().as_ref())
+                .context("Invalid Warp server URL")?;
+        if url.origin() != server.origin() {
+            return Ok(self.external_client.request(method, url));
+        }
+        let mut request = self.storage_client.request(method, url);
+        if let Some(token) = self.get_or_refresh_access_token().await?.as_bearer_token() {
+            request = request.bearer_auth(token);
+        }
+        #[cfg(not(target_family = "wasm"))]
+        for (name, value) in self
+            .ambient_headers(AmbientHeaderPolicy::inherit_all())
+            .await?
+        {
+            request = request.header(name, value);
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            // Fetch strips Authorization on cross-origin redirects. Ambient headers are not
+            // browser credentials and would survive, so they must never be attached here.
+            request = request.fetch_credentials_same_origin();
+        }
+        Ok(request)
     }
 
     /// Returns an owned handle to the shared HTTP client for GraphQL operations.

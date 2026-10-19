@@ -13,10 +13,11 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 use warp_cli::agent::Harness;
+use warp_server_client::base_client::BaseClient;
 
 use super::*;
 use crate::ai::agent::api::ServerConversationToken;
-use crate::ai::agent_sdk::test_support::build_test_http_client;
+use crate::ai::agent_sdk::test_support::build_test_storage_client;
 use crate::ai::artifacts::Artifact;
 use crate::server::server_api::harness_support::{
     CommitSnapshotRequest, CommitSnapshotResponse, ReportArtifactResponse, ResolvePromptRequest,
@@ -77,14 +78,14 @@ impl Drop for DeclarationsFixture {
 /// only care about coordinator timing/gating, not upload success. `commit_snapshot` panics:
 /// it must never be reached when uploads always fail.
 struct FailingUploadTargetsClient {
-    http: http_client::Client,
+    http: BaseClient,
     call_count: AtomicUsize,
 }
 
 impl FailingUploadTargetsClient {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            http: build_test_http_client(),
+            http: build_test_storage_client(),
             call_count: AtomicUsize::new(0),
         })
     }
@@ -161,7 +162,7 @@ impl HarnessSupportClient for FailingUploadTargetsClient {
     async fn fetch_transcript(&self) -> Result<bytes::Bytes> {
         unimplemented!("not used by the coordinator")
     }
-    fn external_http_client(&self) -> &http_client::Client {
+    fn storage_client(&self) -> &BaseClient {
         &self.http
     }
 }
@@ -171,7 +172,7 @@ impl HarnessSupportClient for FailingUploadTargetsClient {
 /// resolves (used to keep an attempt "in flight" for finalization tests).
 struct RecordingClient {
     server_base_url: String,
-    http: http_client::Client,
+    http: BaseClient,
     commit_delay: Duration,
     fail_commit: bool,
     upload_calls: AtomicUsize,
@@ -194,7 +195,7 @@ impl RecordingClient {
     ) -> Arc<Self> {
         Arc::new(Self {
             server_base_url,
-            http: build_test_http_client(),
+            http: build_test_storage_client(),
             commit_delay,
             fail_commit,
             upload_calls: AtomicUsize::new(0),
@@ -292,7 +293,7 @@ impl HarnessSupportClient for RecordingClient {
     async fn fetch_transcript(&self) -> Result<bytes::Bytes> {
         unimplemented!("not used by the coordinator")
     }
-    fn external_http_client(&self) -> &http_client::Client {
+    fn storage_client(&self) -> &BaseClient {
         &self.http
     }
 }

@@ -39,6 +39,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{mpsc, oneshot};
 use warp_core::safe_info;
 use warp_errors::report_error;
+use warp_server_client::base_client::BaseClient;
 use warpui::r#async::FutureExt as _;
 use warpui::r#async::executor::Background;
 
@@ -763,7 +764,7 @@ struct SnapshotManifest {
 
 /// Upload `body` to `target` through the shared retry helper, re-cloning `body` per attempt.
 async fn upload_with_retry(
-    http: &http_client::Client,
+    http: &BaseClient,
     target: &UploadTarget,
     body: Vec<u8>,
     operation: &str,
@@ -827,7 +828,7 @@ pub(crate) async fn upload_snapshot_for_handoff(
     repo_paths: Vec<PathBuf>,
     orphan_file_paths: Vec<PathBuf>,
     client: Arc<dyn AIClient>,
-    http: &http_client::Client,
+    http: &BaseClient,
 ) -> Result<Option<InitialSnapshotToken>> {
     if repo_paths.is_empty() && orphan_file_paths.is_empty() {
         log::info!("Handoff snapshot has no declarations; skipping upload");
@@ -1222,7 +1223,7 @@ async fn upload_gathered_snapshot(
         }
     }
     upload_prepared_snapshot_files(
-        client.external_http_client(),
+        client.storage_client(),
         manifest_filename,
         upload_files,
         repos,
@@ -1234,7 +1235,7 @@ async fn upload_gathered_snapshot(
 }
 
 async fn upload_prepared_snapshot_files(
-    http: &http_client::Client,
+    http: &BaseClient,
     manifest_filename: String,
     upload_files: Vec<SnapshotUploadFile>,
     mut repos: Vec<RepoManifestEntry>,
@@ -1484,7 +1485,7 @@ async fn gather_file(
 /// Produces an [`EntryResult`] labelled with the file's filename, or marked
 /// [`EntryStatus::NoTarget`] if the server did not return a target for it.
 async fn upload_entry(
-    http: &http_client::Client,
+    http: &BaseClient,
     file: &SnapshotUploadFile,
     target_map: &HashMap<String, UploadTarget>,
 ) -> EntryResult {

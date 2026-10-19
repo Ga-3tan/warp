@@ -45,6 +45,7 @@ fn skips_lightbox_update_for_non_screenshot_artifact() {
         }),
         "artifact-123",
         0,
+        Arc::new(ServerApi::new_for_test()),
     );
 
     assert!(image.is_none());
@@ -56,6 +57,7 @@ fn returns_failure_placeholder_for_screenshot_load_errors() {
         Err(anyhow!("network error")),
         "artifact-123",
         0,
+        Arc::new(ServerApi::new_for_test()),
     )
     .expect("expected failure placeholder");
 
@@ -80,6 +82,7 @@ fn resolves_lightbox_image_for_screenshot_artifact() {
         }),
         "screenshot-123",
         0,
+        Arc::new(ServerApi::new_for_test()),
     )
     .expect("expected screenshot image");
 

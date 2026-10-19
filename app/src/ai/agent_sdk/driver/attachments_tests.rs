@@ -6,7 +6,7 @@ use mockito::{Matcher, Server};
 use tempfile::{Builder as TempDirBuilder, NamedTempFile, TempDir};
 
 use super::*;
-use crate::ai::agent_sdk::test_support::build_test_http_client;
+use crate::ai::agent_sdk::test_support::build_test_storage_client;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::server::server_api::ai::MockAIClient;
 
@@ -81,7 +81,7 @@ fn fake_task_id() -> AmbientAgentTaskId {
 #[tokio::test]
 async fn task_downloads_only_retain_successful_files_in_input_order() {
     let dir = TempDir::new().unwrap();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
     let mut server = Server::new_async().await;
     let image = server
         .mock("GET", "/download/image-id")
@@ -143,7 +143,7 @@ async fn e2e_happy_path_downloads_all_and_writes_to_disk() {
     let _guard = FeatureFlag::OzHandoff.override_enabled(true);
     let tempdir = handoff_tempdir();
     let attachments_dir = tempdir.path().to_path_buf();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
     let mut server = Server::new_async().await;
 
     let first_mock = server
@@ -197,7 +197,7 @@ async fn e2e_checkpoint_mode_storage_name_does_not_leak_into_the_written_path() 
     let _guard = FeatureFlag::OzHandoff.override_enabled(true);
     let tempdir = handoff_tempdir();
     let attachments_dir = tempdir.path().to_path_buf();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
     let mut server = Server::new_async().await;
 
     let file_id = "checkpoint/1787245813225-2/snapshot_state.json";
@@ -242,7 +242,7 @@ async fn e2e_traversal_in_filename_cannot_escape_the_handoff_dir() {
     let _guard = FeatureFlag::OzHandoff.override_enabled(true);
     let tempdir = handoff_tempdir();
     let attachments_dir = tempdir.path().to_path_buf();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
     let mut server = Server::new_async().await;
 
     let mock = server
@@ -287,7 +287,7 @@ async fn e2e_filename_without_a_basename_is_rejected_before_downloading() {
     let _guard = FeatureFlag::OzHandoff.override_enabled(true);
     let tempdir = handoff_tempdir();
     let attachments_dir = tempdir.path().to_path_buf();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
     let mut server = Server::new_async().await;
 
     let never_called = server
@@ -319,7 +319,7 @@ async fn e2e_transient_5xx_retried_then_succeeds() {
     let _guard = FeatureFlag::OzHandoff.override_enabled(true);
     let tempdir = handoff_tempdir();
     let attachments_dir = tempdir.path().to_path_buf();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
     let mut server = Server::new_async().await;
 
     let flaky_fail = server
@@ -362,7 +362,7 @@ async fn e2e_permanent_4xx_fails_fast_without_retries() {
     let _guard = FeatureFlag::OzHandoff.override_enabled(true);
     let tempdir = handoff_tempdir();
     let attachments_dir = tempdir.path().to_path_buf();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
     let mut server = Server::new_async().await;
 
     let missing = server
@@ -397,7 +397,7 @@ async fn e2e_retry_exhaustion_marks_failed() {
     let _guard = FeatureFlag::OzHandoff.override_enabled(true);
     let tempdir = handoff_tempdir();
     let attachments_dir = tempdir.path().to_path_buf();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
     let mut server = Server::new_async().await;
 
     let persistent = server
@@ -430,7 +430,7 @@ async fn e2e_partial_success_returns_dir_with_downloaded_subset() {
     let _guard = FeatureFlag::OzHandoff.override_enabled(true);
     let tempdir = handoff_tempdir();
     let attachments_dir = tempdir.path().to_path_buf();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
     let mut server = Server::new_async().await;
 
     let ok_mock = server
@@ -478,7 +478,7 @@ async fn e2e_empty_attachment_list_returns_none_without_creating_dir() {
     let _guard = FeatureFlag::OzHandoff.override_enabled(true);
     let tempdir = handoff_tempdir();
     let attachments_dir = tempdir.path().to_path_buf();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
 
     let result = fetch_and_download_handoff_snapshot_attachments(
         mock_client_returning(Vec::new()),
@@ -502,7 +502,7 @@ async fn e2e_get_handoff_snapshot_attachments_failure_is_fatal() {
     // message with a context describing where it happened.
     let _guard = FeatureFlag::OzHandoff.override_enabled(true);
     let tempdir = handoff_tempdir();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
 
     let mut mock = MockAIClient::new();
     mock.expect_get_handoff_snapshot_attachments()
@@ -541,7 +541,7 @@ async fn e2e_returns_none_when_oz_handoff_flag_is_disabled() {
     let _guard = FeatureFlag::OzHandoff.override_enabled(false);
     let tempdir = handoff_tempdir();
     let attachments_dir = tempdir.path().to_path_buf();
-    let http = build_test_http_client();
+    let http = build_test_storage_client();
 
     // No expect_get_handoff_snapshot_attachments: if the function calls it, the mock panics.
     let mock = MockAIClient::new();

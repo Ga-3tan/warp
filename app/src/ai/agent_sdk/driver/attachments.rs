@@ -11,6 +11,7 @@ use tokio::fs;
 use tokio_util::io::StreamReader;
 use warp_core::features::FeatureFlag;
 use warp_errors::report_error;
+use warp_server_client::base_client::BaseClient;
 
 use crate::ai::agent_sdk::retry::with_bounded_retry;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
@@ -71,12 +72,7 @@ pub(crate) async fn download_attachments(
         return Ok(TaskAttachmentDownloads::default());
     }
 
-    let files = download_and_write_attachments(
-        attachments,
-        &attachments_dir,
-        http_client.external_http_client(),
-    )
-    .await?;
+    let files = download_and_write_attachments(attachments, &attachments_dir, &http_client).await?;
 
     Ok(TaskAttachmentDownloads {
         directory: Some(attachments_dir.to_string_lossy().into_owned()),
@@ -97,7 +93,7 @@ pub(crate) async fn download_attachments(
 #[tracing::instrument(skip_all, err, fields(tags.cloud_agent = true))]
 pub(crate) async fn fetch_and_download_handoff_snapshot_attachments(
     ai_client: Arc<dyn AIClient>,
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
     task_id: AmbientAgentTaskId,
     attachments_dir: PathBuf,
 ) -> anyhow::Result<Option<String>> {
@@ -168,7 +164,7 @@ pub(crate) async fn fetch_and_download_handoff_snapshot_attachments(
 async fn download_and_write_attachments(
     attachments: Vec<TaskAttachment>,
     attachment_dir: &Path,
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
 ) -> anyhow::Result<Vec<DownloadedAttachment>> {
     fs::create_dir_all(attachment_dir)
         .await
@@ -206,7 +202,7 @@ async fn download_and_write_attachments(
 async fn download_task_attachment(
     attachment: TaskAttachment,
     attachment_dir: &Path,
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
 ) -> anyhow::Result<DownloadedAttachment> {
     let safe_filename = Path::new(&attachment.filename)
         .file_name()
@@ -241,7 +237,7 @@ async fn download_task_attachment(
 async fn download_handoff_entry(
     attachment: TaskAttachment,
     handoff_dir: &Path,
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
 ) -> Result<(), (String, String)> {
     // Factor the fields out before the retry closure so `attachment` is fully consumed
     // up-front. The closure borrows the two fields it needs as references.
@@ -277,7 +273,7 @@ async fn download_handoff_entry(
 /// an [`HttpStatusError`] so the retry classifier can decide whether to retry.
 #[tracing::instrument(skip_all, err, fields(tags.cloud_agent = true))]
 async fn download_attachment(
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
     download_url: &str,
     file_path: &Path,
 ) -> anyhow::Result<()> {
@@ -285,12 +281,13 @@ async fn download_attachment(
 
     #[tracing::instrument(skip_all, err, fields(tags.cloud_agent = true))]
     async fn attempt(
-        http_client: &http_client::Client,
+        http_client: &BaseClient,
         download_url: &str,
         file_path: &Path,
     ) -> anyhow::Result<()> {
         let response = http_client
-            .get(download_url)
+            .storage_request(http::Method::GET, download_url)
+            .await?
             .send()
             .await
             .context("Failed to send download request")?;

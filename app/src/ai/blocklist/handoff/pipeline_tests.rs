@@ -154,7 +154,7 @@ fn prepare_falls_back_to_auto_for_an_implicit_local_model() {
                         view.ai_context_model().clone(),
                         SnapshotUploadTarget::Local {
                             ai_client: provider.get_ai_client(),
-                            http: provider.get_http_client(),
+                            http: provider.get(),
                         },
                         HandoffEntryPoint::Ampersand,
                         HandoffSurface::Gui,
@@ -277,7 +277,7 @@ fn pending(
         },
         snapshot_target: SnapshotUploadTarget::Local {
             ai_client,
-            http: Arc::new(http_client::Client::new_for_test()),
+            http: Arc::new(crate::server::server_api::ServerApi::new_for_test()),
         },
         snapshot_disabled: true,
         orchestration_handoff: Some(true),
@@ -371,7 +371,7 @@ fn prepare_rejects_an_empty_source_without_a_prompt() {
                     view.ai_context_model().clone(),
                     SnapshotUploadTarget::Local {
                         ai_client: provider.get_ai_client(),
-                        http: provider.get_http_client(),
+                        http: provider.get(),
                     },
                     HandoffEntryPoint::Ampersand,
                     HandoffSurface::Gui,
@@ -402,7 +402,7 @@ fn prepare_accepts_a_cwd_snapshot_without_a_source_or_prompt() {
                         view.ai_context_model().clone(),
                         SnapshotUploadTarget::Local {
                             ai_client: provider.get_ai_client(),
-                            http: provider.get_http_client(),
+                            http: provider.get(),
                         },
                         HandoffEntryPoint::Ampersand,
                         HandoffSurface::Gui,
@@ -450,7 +450,7 @@ fn prepare_preserves_untransferred_source_attachments() {
                         view.ai_context_model().clone(),
                         SnapshotUploadTarget::Local {
                             ai_client: provider.get_ai_client(),
-                            http: provider.get_http_client(),
+                            http: provider.get(),
                         },
                         HandoffEntryPoint::Ampersand,
                         HandoffSurface::Gui,
@@ -548,7 +548,7 @@ fn prepare_collects_completed_descendant_paths() {
                         view.ai_context_model().clone(),
                         SnapshotUploadTarget::Local {
                             ai_client: provider.get_ai_client(),
-                            http: provider.get_http_client(),
+                            http: provider.get(),
                         },
                         HandoffEntryPoint::Ampersand,
                         HandoffSurface::Gui,
@@ -644,7 +644,7 @@ fn prepare_orders_guards_cancellation_token_check_and_attachment_transfer() {
                     view.ai_context_model().clone(),
                     SnapshotUploadTarget::Local {
                         ai_client: provider.get_ai_client(),
-                        http: provider.get_http_client(),
+                        http: provider.get(),
                     },
                     HandoffEntryPoint::Ampersand,
                     HandoffSurface::Gui,
@@ -686,7 +686,7 @@ fn prepare_orders_guards_cancellation_token_check_and_attachment_transfer() {
                     view.ai_context_model().clone(),
                     SnapshotUploadTarget::Local {
                         ai_client: provider.get_ai_client(),
-                        http: provider.get_http_client(),
+                        http: provider.get(),
                     },
                     HandoffEntryPoint::Ampersand,
                     HandoffSurface::Gui,
@@ -733,7 +733,7 @@ fn prepare_orders_guards_cancellation_token_check_and_attachment_transfer() {
                     view.ai_context_model().clone(),
                     SnapshotUploadTarget::Local {
                         ai_client: provider.get_ai_client(),
-                        http: provider.get_http_client(),
+                        http: provider.get(),
                     },
                     HandoffEntryPoint::Ampersand,
                     HandoffSurface::Gui,

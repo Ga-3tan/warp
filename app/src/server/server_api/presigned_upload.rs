@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 #[cfg(not(target_family = "wasm"))]
 use crc::{CRC_32_ISCSI, Crc};
 pub use warp_server_client::HttpStatusError;
+use warp_server_client::base_client::BaseClient;
 
 #[cfg(feature = "local_fs")]
 use super::ai::FileArtifactUploadTargetInfo;
@@ -205,8 +206,8 @@ struct UploadErrorContext {
     failure: &'static str,
 }
 
-fn build_upload_request<'a>(
-    http_client: &'a http_client::Client,
+async fn build_upload_request<'a>(
+    http_client: &'a BaseClient,
     target: &NormalizedUploadTarget<'_>,
     content_length: Option<u64>,
 ) -> Result<http_client::RequestBuilder<'a>> {
@@ -216,13 +217,14 @@ fn build_upload_request<'a>(
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case(CONTENT_LENGTH_HEADER_NAME));
 
-    let mut request = match method.as_str() {
-        "GET" => http_client.get(target.url),
-        "POST" => http_client.post(target.url),
-        "PUT" => http_client.put(target.url),
-        "DELETE" => http_client.delete(target.url),
+    let method = match method.as_str() {
+        "GET" => http::Method::GET,
+        "POST" => http::Method::POST,
+        "PUT" => http::Method::PUT,
+        "DELETE" => http::Method::DELETE,
         other => return Err(anyhow!("Unsupported HTTP method: {other}")),
     };
+    let mut request = http_client.storage_request(method, target.url).await?;
 
     for (name, value) in &target.headers {
         request = request.header(*name, *value);
@@ -253,13 +255,14 @@ async fn ensure_upload_succeeded(
 }
 
 async fn send_upload_request(
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
     target: &NormalizedUploadTarget<'_>,
     body: impl Into<reqwest::Body>,
     content_length: u64,
     error_context: UploadErrorContext,
 ) -> Result<()> {
-    let response = build_upload_request(http_client, target, Some(content_length))?
+    let response = build_upload_request(http_client, target, Some(content_length))
+        .await?
         .body(body)
         .send()
         .await
@@ -270,7 +273,7 @@ async fn send_upload_request(
 }
 
 pub(crate) async fn upload_to_target(
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
     target: &UploadTarget,
     body: impl UploadBody,
 ) -> Result<()> {
@@ -286,7 +289,7 @@ pub(crate) async fn upload_to_target(
 /// [`upload_file_to_target`]. Routes the request to either a plain body upload
 /// or a multipart form upload based on whether the target has form fields.
 async fn send_upload(
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
     target: &NormalizedUploadTarget<'_>,
     body: impl UploadBody,
     precomputed_crc32c: Option<String>,
@@ -320,14 +323,14 @@ async fn send_upload(
 /// compute the checksum when requested by the upload target.
 #[cfg(not(target_family = "wasm"))]
 async fn send_multipart_upload(
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
     target: &NormalizedUploadTarget<'_>,
     body: impl UploadBody,
     precomputed_crc32c: Option<String>,
     error_context: UploadErrorContext,
 ) -> Result<()> {
     let form = build_multipart_form(target, body, precomputed_crc32c).await?;
-    let request = build_upload_request(http_client, target, None)?;
+    let request = build_upload_request(http_client, target, None).await?;
     let response = request
         .multipart(form)
         .send()
@@ -401,7 +404,7 @@ fn encode_crc32c_base64(crc32c: u32) -> String {
 /// pass it to `confirmFileArtifactUpload`.
 #[cfg(feature = "local_fs")]
 pub(crate) async fn upload_file_to_target(
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
     target: &FileArtifactUploadTargetInfo,
     body: impl UploadBody,
 ) -> Result<String> {

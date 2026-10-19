@@ -2093,8 +2093,7 @@ async fn upload_pending_attachments_to_task(
             .zip(prepare_response.attachments.iter())
         {
             let target = upload_info.resolve_upload_target(mime_type);
-            let result =
-                upload_to_target(server_api.http_client(), &target, file_bytes.clone()).await;
+            let result = upload_to_target(&server_api, &target, file_bytes.clone()).await;
 
             outcomes[*orig_idx] = Some(match result {
                 Ok(()) => TaskAttachmentUploadOutcome::Uploaded {

@@ -104,23 +104,44 @@ impl PublicApiError {
 }
 
 impl BaseClient {
-    /// Downloads bytes from a presigned URL without attaching Warp headers or credentials.
+    /// Downloads storage bytes with credentials scoped to the Warp server origin.
     pub async fn download_presigned(&self, url: &str) -> Result<bytes::Bytes> {
-        let response = self
-            .external_http_client()
-            .get(url)
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .context("Failed to send presigned download request")?;
-        if !response.status().is_success() {
-            return Err(HttpStatusError::new(response.status().as_u16(), String::new()).into());
-        }
-        response
+        self.download_storage_response(url)
+            .await?
             .bytes()
             .await
             .map_err(reqwest::Error::without_url)
-            .context("Failed to read presigned download")
+            .context("Failed to read storage download")
+    }
+
+    /// Opens a storage download, rebuilding credentials for each redirect origin.
+    pub async fn download_storage_response(&self, url: &str) -> Result<http_client::Response> {
+        let mut url = reqwest::Url::parse(url).context("Invalid storage download URL")?;
+        for _ in 0..10 {
+            let response = self
+                .storage_request(http::Method::GET, url.as_str())
+                .await?
+                .timeout(std::time::Duration::from_secs(300))
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .context("Failed to send storage download request")?;
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get(http::header::LOCATION)
+                    .context("Storage redirect has no location")?
+                    .to_str()
+                    .context("Invalid storage redirect location")?;
+                url = url.join(location).context("Invalid storage redirect URL")?;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(HttpStatusError::new(response.status().as_u16(), String::new()).into());
+            }
+            return Ok(response);
+        }
+        anyhow::bail!("Too many storage download redirects")
     }
 
     /// Sends a GET request to a public API endpoint and returns the raw response on success.

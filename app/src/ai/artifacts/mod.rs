@@ -1,12 +1,14 @@
 use std::path::Path;
 #[cfg(feature = "local_fs")]
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use ui_components::lightbox::{LightboxImage, LightboxImageSource};
 use warp_errors::report_error;
 use warp_multi_agent_api as api;
 use warpui::SingletonEntity;
+use warpui::assets::asset_cache::{AssetSource, AsyncAssetId, AsyncAssetType};
 #[cfg(feature = "local_fs")]
 use warpui::platform::SaveFilePickerConfiguration;
 
@@ -16,8 +18,8 @@ use crate::ai::artifact_download::sanitized_basename;
 #[cfg(feature = "local_fs")]
 use crate::ai::artifact_download::{default_download_directory, download_artifact_bytes};
 use crate::notebooks::NotebookId;
-use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::ai::ArtifactDownloadResponse;
+use crate::server::server_api::{ServerApi, ServerApiProvider};
 use crate::view_components::DismissibleToast;
 #[cfg(feature = "local_fs")]
 use crate::view_components::ToastLink;
@@ -25,6 +27,8 @@ use crate::workspace::{ToastStack, WorkspaceAction};
 
 pub mod buttons;
 pub use buttons::{ArtifactButtonsRow, ArtifactButtonsRowEvent};
+struct ScreenshotArtifactAsset;
+impl AsyncAssetType for ScreenshotArtifactAsset {}
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "artifact_type", content = "data")]
@@ -389,18 +393,23 @@ pub fn open_screenshot_lightbox<V: warpui::View>(
     // TODO(QUALITY-318): We should cache the signed URL for each artifact UUID so
     // we avoid fetching screenshots already in the asset cache.
     let ai_client = ServerApiProvider::handle(ctx).as_ref(ctx).get_ai_client();
+    let storage_client = ServerApiProvider::handle(ctx).as_ref(ctx).get();
 
     for (i, uid) in artifact_uids.iter().enumerate() {
         let ai_client = ai_client.clone();
+        let storage_client = storage_client.clone();
         let uid = uid.clone();
         let uid_for_callback = uid.clone();
 
         ctx.spawn(
             async move { ai_client.get_artifact_download(&uid).await },
             move |_me, result, ctx| {
-                if let Some(image) =
-                    screenshot_lightbox_image_from_download_result(result, &uid_for_callback, i)
-                {
+                if let Some(image) = screenshot_lightbox_image_from_download_result(
+                    result,
+                    &uid_for_callback,
+                    i,
+                    storage_client,
+                ) {
                     ctx.dispatch_typed_action(&WorkspaceAction::UpdateLightboxImage {
                         index: i,
                         image,
@@ -415,11 +424,19 @@ fn screenshot_lightbox_image_from_download_result(
     result: anyhow::Result<ArtifactDownloadResponse>,
     uid_for_callback: &str,
     index: usize,
+    storage_client: Arc<ServerApi>,
 ) -> Option<LightboxImage> {
     match result {
         Ok(ArtifactDownloadResponse::Screenshot { data, .. }) => Some(LightboxImage {
             source: LightboxImageSource::Resolved {
-                asset_source: asset_cache::url_source(data.download_url),
+                asset_source: AssetSource::Async {
+                    id: AsyncAssetId::new::<ScreenshotArtifactAsset>(data.download_url.clone()),
+                    fetch: Arc::new(move || {
+                        let client = storage_client.clone();
+                        let url = data.download_url.clone();
+                        Box::pin(async move { client.download_presigned(&url).await })
+                    }),
+                },
             },
             description: data
                 .description
@@ -515,7 +532,7 @@ fn open_file_download_picker<V: warpui::View>(
             let artifact_for_download = artifact.clone();
             ctx.spawn(
                 async move {
-                    download_artifact_bytes(server_api.http_client(), &artifact_for_download, &path)
+                    download_artifact_bytes(&server_api, &artifact_for_download, &path)
                         .await
                 },
                 move |_me, result, ctx| match result {

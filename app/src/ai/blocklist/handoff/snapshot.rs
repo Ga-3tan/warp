@@ -40,7 +40,7 @@ pub enum SnapshotUploadTarget {
     /// Run `derive_touched_workspace` + `upload_snapshot_for_handoff` locally.
     Local {
         ai_client: Arc<dyn AIClient>,
-        http: Arc<http_client::Client>,
+        http: Arc<crate::server::server_api::ServerApi>,
     },
     /// Delegate to the remote server daemon via `UploadHandoffSnapshot` RPC.
     Remote {
@@ -162,7 +162,7 @@ pub(crate) fn resolve_upload_target(
             let server_api_provider = ServerApiProvider::as_ref(ctx);
             SnapshotUploadTarget::Local {
                 ai_client: server_api_provider.get_ai_client(),
-                http: server_api_provider.get_http_client(),
+                http: server_api_provider.get(),
             }
         }
     }

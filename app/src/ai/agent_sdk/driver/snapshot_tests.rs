@@ -9,11 +9,12 @@ use mockito::{Matcher, Server, ServerGuard};
 use tempfile::{Builder as TempDirBuilder, TempDir};
 use tokio::runtime::Runtime;
 use warp_cli::agent::Harness;
+use warp_server_client::base_client::BaseClient;
 
 use super::*;
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent_sdk::retry::MAX_ATTEMPTS;
-use crate::ai::agent_sdk::test_support::build_test_http_client;
+use crate::ai::agent_sdk::test_support::build_test_storage_client;
 use crate::ai::artifacts::Artifact;
 use crate::server::server_api::harness_support::{
     CommitSnapshotResponse, ReportArtifactResponse, ResolvePromptRequest, ResolvedHarnessPrompt,
@@ -38,7 +39,7 @@ use crate::server::server_api::harness_support::{
 /// exercise at the trait boundary without standing up a whole backend.
 struct TestClient {
     server_base_url: String,
-    http: http_client::Client,
+    http: BaseClient,
     fail_get_targets: bool,
     /// Number of trailing response entries to drop, simulating a server that returns fewer
     /// targets than the request contained. Under positional alignment those files end up
@@ -60,7 +61,7 @@ impl TestClient {
     fn base(server_base_url: String) -> Self {
         Self {
             server_base_url,
-            http: build_test_http_client(),
+            http: build_test_storage_client(),
             fail_get_targets: false,
             drop_trailing_targets: 0,
             drop_trailing_first_call_only: false,
@@ -235,7 +236,7 @@ impl HarnessSupportClient for TestClient {
         })
     }
 
-    fn external_http_client(&self) -> &http_client::Client {
+    fn storage_client(&self) -> &BaseClient {
         &self.http
     }
 }

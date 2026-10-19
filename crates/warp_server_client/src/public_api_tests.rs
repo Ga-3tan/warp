@@ -16,6 +16,149 @@ use crate::base_client::{
 struct EmptyIapTokenProvider;
 
 #[test]
+fn storage_transfers_authenticate_the_server_origin() {
+    let auth = AuthState::new_logged_out_for_test();
+    auth.set_remote_server_bearer_token("transfer-token".into());
+    let (client, _) = base_client_with_auth(auth, Some("cloud-mode".into()), false);
+    client.set_ambient_agent_task_id(Some("transfer-run".into()));
+    for method in [http::Method::GET, http::Method::PUT] {
+        let path = format!("/storage-auth-{}", method.as_str());
+        let request = ChannelState::mock_server()
+            .mock(method.as_str(), path.as_str())
+            .match_header("authorization", "Bearer transfer-token")
+            .match_header(CLOUD_AGENT_ID_HEADER, "transfer-run")
+            .match_header(AMBIENT_WORKLOAD_TOKEN_HEADER, "test-workload-token")
+            .match_header(AGENT_SOURCE_HEADER, "cloud-mode")
+            .with_status(200)
+            .create();
+        block_on(async {
+            let response = client
+                .storage_request(
+                    method,
+                    &format!("{}{path}", ChannelState::server_root_url()),
+                )
+                .await
+                .unwrap()
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+        });
+        request.assert();
+    }
+}
+
+#[test]
+fn authenticated_storage_upload_does_not_follow_redirects() {
+    let mut external = mockito::Server::new();
+    let destination = external.mock("PUT", "/upload-target").expect(0).create();
+    let redirect = ChannelState::mock_server()
+        .mock("PUT", "/storage-upload-redirect")
+        .match_header("authorization", "Bearer transfer-token")
+        .match_header(AMBIENT_WORKLOAD_TOKEN_HEADER, "test-workload-token")
+        .with_status(307)
+        .with_header("location", &format!("{}/upload-target", external.url()))
+        .create();
+    let auth = AuthState::new_logged_out_for_test();
+    auth.set_remote_server_bearer_token("transfer-token".into());
+    let (client, _) = base_client_with_auth(auth, None, false);
+    let status = block_on(async {
+        client
+            .storage_request(
+                http::Method::PUT,
+                &format!(
+                    "{}/storage-upload-redirect",
+                    ChannelState::server_root_url()
+                ),
+            )
+            .await
+            .unwrap()
+            .body("private upload")
+            .send()
+            .await
+            .unwrap()
+            .status()
+    });
+    assert_eq!(status, http::StatusCode::TEMPORARY_REDIRECT);
+    redirect.assert();
+    destination.assert();
+}
+
+#[test]
+fn storage_transfers_reject_origin_lookalikes() {
+    let (client, _) = base_client(false);
+    let server = reqwest::Url::parse(ChannelState::server_root_url().as_ref()).unwrap();
+    let mut other_port = server.clone();
+    other_port
+        .set_port(Some(if server.port_or_known_default() == Some(443) {
+            444
+        } else {
+            443
+        }))
+        .unwrap();
+    let mut other_scheme = server.clone();
+    other_scheme
+        .set_scheme(if server.scheme() == "https" {
+            "http"
+        } else {
+            "https"
+        })
+        .unwrap();
+    for url in [
+        other_port.to_string(),
+        other_scheme.to_string(),
+        "https://app.warp.dev.example.com/object".into(),
+        "https://app.warp.dev@example.com/object".into(),
+        "https://example.com/object?origin=https://app.warp.dev".into(),
+    ] {
+        let (transport, request) = block_on(client.storage_request(http::Method::GET, &url))
+            .unwrap()
+            .build_split();
+        request.unwrap();
+        assert!(
+            std::ptr::eq(transport, client.external_http_client()),
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn authenticated_storage_redirect_does_not_forward_credentials() {
+    let mut external = mockito::Server::new();
+    let destination = external
+        .mock("GET", "/redirect-target")
+        .match_header("authorization", mockito::Matcher::Missing)
+        .match_header("proxy-authorization", mockito::Matcher::Missing)
+        .match_header("cookie", mockito::Matcher::Missing)
+        .match_header(AMBIENT_WORKLOAD_TOKEN_HEADER, mockito::Matcher::Missing)
+        .match_header(CLOUD_AGENT_ID_HEADER, mockito::Matcher::Missing)
+        .with_status(200)
+        .with_body("screenshot bytes")
+        .create();
+    let redirect = ChannelState::mock_server()
+        .mock("GET", "/storage-redirect")
+        .match_header("authorization", "Bearer transfer-token")
+        .match_header(AMBIENT_WORKLOAD_TOKEN_HEADER, "test-workload-token")
+        .with_status(307)
+        .with_header("location", &format!("{}/redirect-target", external.url()))
+        .create();
+    let auth = AuthState::new_logged_out_for_test();
+    auth.set_remote_server_bearer_token("transfer-token".into());
+    let (client, _) = base_client_with_auth(auth, None, false);
+    assert_eq!(
+        block_on(client.download_presigned(&format!(
+            "{}/storage-redirect",
+            ChannelState::server_root_url()
+        )))
+        .unwrap()
+        .as_ref(),
+        b"screenshot bytes"
+    );
+    redirect.assert();
+    destination.assert();
+}
+
+#[test]
 fn presigned_download_keeps_api_context_off_storage() {
     let mut storage = mockito::Server::new();
     let query = "X-Amz-Signature=test%2Bsignature&key=a%2Fb&key=c+%20d";

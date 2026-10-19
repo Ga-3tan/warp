@@ -513,7 +513,7 @@ impl ServerApi {
     }
 
     #[cfg(any(test, all(feature = "tui", feature = "test-util")))]
-    fn new_for_test() -> Self {
+    pub(crate) fn new_for_test() -> Self {
         let (tx, _) = async_channel::unbounded();
         let auth_state = Arc::new(AuthState::new_for_test());
         let client = Arc::new(http_client::Client::new_for_test());

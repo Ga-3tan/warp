@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use warp_server_client::base_client::BaseClient;
 use warp_util::standardized_path::StandardizedPath;
 
 use crate::ai::agent_sdk::driver::upload_snapshot_for_handoff;
@@ -33,7 +34,7 @@ use crate::server::server_api::ai::{AIClient, InitialSnapshotToken};
 pub(crate) async fn gather_and_upload_handoff_snapshot(
     paths: Vec<StandardizedPath>,
     ai_client: Arc<dyn AIClient>,
-    http: &http_client::Client,
+    http: &BaseClient,
 ) -> Result<Option<InitialSnapshotToken>> {
     let resolved_paths: Vec<PathBuf> = paths
         .into_iter()

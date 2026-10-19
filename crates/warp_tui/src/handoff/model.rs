@@ -161,7 +161,7 @@ impl TuiHandoffModel {
                 context,
                 SnapshotUploadTarget::Local {
                     ai_client: provider.get_ai_client(),
-                    http: provider.get_http_client(),
+                    http: provider.get(),
                 },
                 HandoffEntryPoint::SlashCommand,
                 HandoffSurface::Tui,

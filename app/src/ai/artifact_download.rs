@@ -3,6 +3,9 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(feature = "local_fs")]
+use warp_server_client::base_client::BaseClient;
+
+#[cfg(feature = "local_fs")]
 use crate::server::server_api::ai::ArtifactDownloadResponse;
 
 pub(crate) fn sanitized_basename(path_or_filename: &str) -> Option<String> {
@@ -57,13 +60,11 @@ pub(crate) fn default_download_directory() -> Option<PathBuf> {
 
 #[cfg(feature = "local_fs")]
 pub(crate) async fn download_artifact_bytes(
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
     artifact: &ArtifactDownloadResponse,
     path: &Path,
 ) -> anyhow::Result<()> {
-    use std::time::Duration;
-
-    use anyhow::{Context as _, anyhow};
+    use anyhow::Context as _;
     use futures::TryStreamExt as _;
     use tokio_util::io::StreamReader;
 
@@ -77,19 +78,9 @@ pub(crate) async fn download_artifact_bytes(
     }
 
     let response = http_client
-        .get(artifact.download_url())
-        .timeout(Duration::from_secs(300))
-        .send()
+        .download_storage_response(artifact.download_url())
         .await
-        .with_context(|| {
-            format!(
-                "Failed to download artifact '{}' from signed URL",
-                artifact.artifact_uid()
-            )
-        })?;
-    let response = response
-        .error_for_status()
-        .map_err(|err| anyhow!("Artifact download failed: {err}"))?;
+        .with_context(|| format!("Failed to download artifact '{}'", artifact.artifact_uid()))?;
 
     let mut file = tokio::fs::File::create(path)
         .await

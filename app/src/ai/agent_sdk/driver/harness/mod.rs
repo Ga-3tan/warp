@@ -798,7 +798,7 @@ pub(crate) async fn upload_block_snapshot(
         .to_json()
         .with_context(|| format!("Unable to serialize block for conversation {conversation_id}"))?;
 
-    upload_to_target(client.external_http_client(), &target, body).await
+    upload_to_target(client.storage_client(), &target, body).await
 }
 
 /// Fetch the current block snapshot for `block_id` and upload it to the server.

@@ -236,10 +236,30 @@ impl Client {
         builder
     }
 
+    /// Creates a transport for credential-bearing storage transfers.
+    pub fn new_storage_transfer() -> Self {
+        #[cfg_attr(target_family = "wasm", expect(unused_mut))]
+        let mut builder = reqwest::Client::builder();
+        #[cfg(not(target_family = "wasm"))]
+        {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        Self::from_client_builder(builder).expect("should not fail to create storage client")
+    }
     pub fn get<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         self.builder(self.wrapped.get(url), include_warp_headers, iap_token)
+    }
+
+    pub fn request<U: IntoUrl + Clone>(&self, method: http::Method, url: U) -> RequestBuilder<'_> {
+        let include_warp_headers = Self::include_warp_http_headers(url.clone());
+        let iap_token = self.iap_token_for(url.clone());
+        self.builder(
+            self.wrapped.request(method, url),
+            include_warp_headers,
+            iap_token,
+        )
     }
 
     pub fn post<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
@@ -466,6 +486,13 @@ fn current_trace_link_header() -> Option<String> {
 }
 
 impl<'a> RequestBuilder<'a> {
+    #[cfg(target_family = "wasm")]
+    pub fn fetch_credentials_same_origin(self) -> Self {
+        Self {
+            wrapped: self.wrapped.fetch_credentials_same_origin(),
+            ..self
+        }
+    }
     pub fn build(self) -> reqwest::Result<Request> {
         self.build_split().1
     }

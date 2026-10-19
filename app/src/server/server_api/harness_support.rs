@@ -12,6 +12,7 @@ use mockall::automock;
 use warp_cli::agent::Harness;
 #[cfg(not(target_family = "wasm"))]
 use warp_server_client::PresignedDownloadResponse;
+use warp_server_client::base_client::BaseClient;
 
 #[path = "harness_usage/publication.rs"]
 mod publication;
@@ -412,8 +413,8 @@ pub trait HarnessSupportClient: 'static + Send + Sync {
     /// surface a resume-specific error.
     async fn fetch_transcript(&self) -> Result<bytes::Bytes>;
 
-    /// Get an HTTP client to use with [`UploadTarget`]s for saving blobs.
-    fn external_http_client(&self) -> &http_client::Client;
+    /// Returns the authenticated storage transfer client.
+    fn storage_client(&self) -> &BaseClient;
 }
 
 impl ServerApi {
@@ -690,14 +691,14 @@ impl HarnessSupportClient for ServerApi {
         }
     }
 
-    fn external_http_client(&self) -> &http_client::Client {
-        self.base_client.external_http_client()
+    fn storage_client(&self) -> &BaseClient {
+        &self.base_client
     }
 }
 
 /// Upload a blob to a presigned upload target.
 pub async fn upload_to_target(
-    http_client: &http_client::Client,
+    http_client: &BaseClient,
     target: &UploadTarget,
     body: impl UploadBody,
 ) -> Result<()> {
