@@ -1,21 +1,25 @@
 //! Agent SDK entry points for invoking Agent-related functionality from the app.
 //! For now this provides a simple runner that echoes the received command.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ai::api_keys::{ApiKeyManager, AwsCredentialsRefreshStrategy};
 use anyhow::Context;
 pub use driver::AgentDriver;
 use driver::AgentDriverError;
+use driver::agent_setup::configured_skills::{self, merge_skill_dirs};
 pub(crate) use driver::harness::{ClaudeHarness, task_env_vars, validate_cli_installed};
 use telemetry::CliTelemetryEvent;
 use tracing::Instrument as _;
 use warp_cli::agent::{
-    AgentCommand, AgentProfileCommand, Harness, OutputFormat, Prompt, RunAgentArgs,
+    AgentCommand, AgentProfileCommand, Harness, HarnessTransport, OutputFormat, Prompt,
+    RunAgentArgs,
 };
 use warp_cli::api_key::ApiKeyCommand;
 use warp_cli::artifact::ArtifactCommand;
@@ -31,14 +35,17 @@ use warp_cli::runner::RunnerCommand;
 use warp_cli::schedule::ScheduleSubcommand;
 use warp_cli::secret::SecretCommand;
 use warp_cli::share::ShareRequest;
+use warp_cli::skill::SkillSpec;
 use warp_cli::task::{MessageCommand, TaskCommand};
 use warp_cli::{CliCommand, GlobalOptions, OZ_HARNESS_ENV};
 use warp_core::features::FeatureFlag;
 use warp_errors::report_error;
 use warp_graphql::object_permissions::OwnerType;
+use warp_graphql::queries::execution_config::ExecutionConfiguration;
 use warp_isolation_platform::IsolationPlatformError;
 #[cfg(not(target_family = "wasm"))]
 use warp_logging::log_file_path;
+use warp_managed_secrets::{ManagedSecretValue, convert_task_secrets};
 use warp_server_client::iap::{IapManager, IapManagerEvent};
 use warpui::platform::TerminationMode;
 use warpui::{AppContext, ModelSpawner, SingletonEntity};
@@ -55,7 +62,7 @@ use crate::ai::agent_sdk::setup_observability::{
     OzRunTimelineEvent, SetupClientEventReporter, SetupStep,
 };
 use crate::ai::ambient_agents::AmbientAgentTaskId;
-use crate::ai::ambient_agents::task::HarnessConfig;
+use crate::ai::ambient_agents::task::{HarnessConfig, TaskAttachment};
 use crate::ai::attachment_utils::attachments_download_dir;
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::aws_credentials::{BedrockOidcCredentialsConfig, refresh_aws_credentials_oidc};
@@ -63,9 +70,7 @@ use crate::ai::cloud_environments::{
     AmbientAgentEnvironment, CloudAmbientAgentEnvironment, SourceRepo,
 };
 use crate::ai::llms::LLMId;
-use crate::ai::skills::{
-    ResolveSkillError, ResolvedSkill, clone_repo_for_skill, resolve_skill_spec,
-};
+use crate::ai::skills::ResolvedSkill;
 use crate::auth::AuthStateProvider;
 use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
 use crate::cloud_object::CloudObjectLookup as _;
@@ -73,14 +78,16 @@ use crate::cloud_object::model::persistence::CloudModel;
 use crate::send_telemetry_sync_from_app_ctx;
 use crate::server::ids::{ServerId, SyncId};
 use crate::server::retry_strategies::with_retry;
-use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::ai::{
     AIClient, AgentConfigSnapshot, GitCredential, TaskGitCredentialsError,
 };
 use crate::server::server_api::managed_secrets::AppManagedSecretManager as ManagedSecretManager;
+use crate::server::server_api::{ServerApi, ServerApiProvider};
 use crate::server::team_scope::RequestTeamScope;
 use crate::terminal::view::ConversationRestorationInNewPaneType;
 use crate::workflows::workflow::Workflow;
+#[cfg(not(target_family = "wasm"))]
+use crate::workspaces::update_manager::{TeamUpdateManager, WorkspaceMetadataRetryPolicy};
 use crate::workspaces::user_workspaces::HeadlessTeamScope;
 
 mod admin;
@@ -95,6 +102,7 @@ mod config_file;
 pub(crate) mod driver;
 mod environment;
 pub(crate) mod environment_snapshot;
+mod execution_config;
 mod federate;
 mod harness_support;
 #[cfg(not(target_family = "wasm"))]
@@ -114,6 +122,8 @@ mod runner;
 mod schedule;
 mod secret;
 pub(crate) mod setup_observability;
+#[cfg(not(target_family = "wasm"))]
+mod standby;
 mod telemetry;
 #[cfg(test)]
 mod test_support;
@@ -133,24 +143,6 @@ fn maybe_warn_team_api_key(ctx: &AppContext) {
     );
 }
 
-fn validated_driver_repositories_for_preparation(
-    options: &AgentDriverOptions,
-) -> Result<Vec<SourceRepo>, driver::environment::PrepareEnvironmentError> {
-    let source_repos = driver::environment::merge_repos_deduped(
-        options
-            .environment
-            .as_ref()
-            .map(AmbientAgentEnvironment::effective_repos)
-            .unwrap_or_default(),
-        options.additional_source_repos.clone(),
-    )?;
-    driver::environment::validate_repository_preparation_overrides(
-        &source_repos,
-        &options.repository_preparation_overrides,
-    )?;
-    Ok(source_repos)
-}
-
 fn bedrock_oidc_credentials_config(
     options: &AgentDriverOptions,
     role_arn: String,
@@ -167,6 +159,22 @@ fn bedrock_oidc_credentials_config(
         role_arn,
         region,
     })
+}
+
+pub(crate) fn run_environment_checkout(
+    args: &warp_cli::environment_checkout::EnvironmentCheckoutArgs,
+) -> anyhow::Result<()> {
+    #[cfg(feature = "local_fs")]
+    {
+        driver::environment_checkout::run(args)
+    }
+    #[cfg(not(feature = "local_fs"))]
+    {
+        let _ = args;
+        Err(anyhow::anyhow!(
+            "environment checkout requires filesystem support"
+        ))
+    }
 }
 
 /// Run a Warp CLI command.
@@ -196,6 +204,7 @@ fn dispatch_command(
             }
             environment::run(ctx, global_options, environment_cmd)
         }
+        CliCommand::EnvironmentCheckout(args) => run_environment_checkout(&args),
         CliCommand::MCP(mcp_cmd) => mcp::run(ctx, global_options, mcp_cmd),
         CliCommand::Run(task_cmd) => run_task(ctx, global_options, task_cmd),
         CliCommand::Model(model_cmd) => model::run(ctx, global_options, model_cmd),
@@ -268,39 +277,6 @@ fn dispatch_command(
     }
 }
 
-fn format_skill_resolution_error(err: ResolveSkillError) -> String {
-    match err {
-        ResolveSkillError::NotFound { skill } => {
-            format!("Skill '{skill}' not found")
-        }
-        ResolveSkillError::RepoNotFound { repo } => {
-            format!("Repository '{repo}' not found")
-        }
-        ResolveSkillError::Ambiguous { skill, candidates } => {
-            let mut msg = format!(
-                "Skill '{skill}' is ambiguous; specify as repo:skill_name\n\nCandidates:\n"
-            );
-            for path in candidates {
-                msg.push_str(&format!("- {}\n", path.display()));
-            }
-            msg
-        }
-        ResolveSkillError::OrgMismatch {
-            repo,
-            expected,
-            found,
-        } => {
-            format!("Repository '{repo}' found but belongs to org '{found}', expected '{expected}'")
-        }
-        ResolveSkillError::ParseFailed { path, message } => {
-            format!("Failed to parse skill file {}: {message}", path.display())
-        }
-        ResolveSkillError::CloneFailed { org, repo, message } => {
-            format!("Failed to clone repository '{org}/{repo}': {message}")
-        }
-    }
-}
-
 /// Run the agent with the provided command.
 fn run_agent(
     ctx: &mut AppContext,
@@ -326,6 +302,11 @@ fn run_agent(
             if args.harness == Harness::OpenCode {
                 return Err(anyhow::anyhow!(
                     "The opencode harness is only supported for local child agent launches."
+                ));
+            }
+            if args.harness_transport.is_some() && !FeatureFlag::AcpHarness.is_enabled() {
+                return Err(anyhow::anyhow!(
+                    "unexpected argument '--harness-transport' found"
                 ));
             }
 
@@ -374,6 +355,12 @@ fn run_agent(
                 return Err(anyhow::anyhow!("unexpected argument '--runner' found"));
             }
             ambient::run_ambient_agent(ctx, args)
+        }
+        #[cfg(not(target_family = "wasm"))]
+        AgentCommand::RunCloudStandby(args) => standby::run(ctx, args),
+        #[cfg(target_family = "wasm")]
+        AgentCommand::RunCloudStandby(_) => {
+            Err(anyhow::anyhow!("invalid value 'run-cloud-standby'"))
         }
         AgentCommand::Profile(sub) => profiles::run(ctx, global_options, sub),
         AgentCommand::List(args) => {
@@ -515,7 +502,7 @@ fn build_merged_config_and_task(
         model: model_override,
         profile: args.profile.clone(),
         mcp_specs: runtime_mcp_specs,
-        harness: harness_kind(args.harness)?,
+        harness: harness_kind(args.harness, args.harness_transport.unwrap_or_default())?,
     };
 
     Ok((merged_config, task))
@@ -588,16 +575,166 @@ fn build_server_side_task(
         model: model_override,
         profile,
         mcp_specs: runtime_mcp_specs,
-        harness: harness_kind(args.harness)?,
+        harness: harness_kind(args.harness, args.harness_transport.unwrap_or_default())?,
     };
 
     Ok((config, task))
+}
+
+fn factory_repository_contract(task_id: Option<AmbientAgentTaskId>, enabled: bool) -> bool {
+    task_id.is_some()
+        && enabled
+        && std::env::var_os("WARP_FACTORY_ID").is_some_and(|id| !id.is_empty())
+}
+
+#[derive(Clone, Copy)]
+struct RepositoryContract {
+    supports_deferred_repositories: bool,
+    use_factory_repositories: bool,
+}
+
+fn build_execution_task_and_options(
+    args: &RunAgentArgs,
+    config: ExecutionConfiguration,
+    repository_contract: RepositoryContract,
+    working_dir: PathBuf,
+    first_skill: Option<ResolvedSkill>,
+    skill_discovery_dirs: Vec<PathBuf>,
+    ctx: &mut AppContext,
+) -> anyhow::Result<(
+    AgentDriverOptions,
+    Task,
+    Option<String>,
+    crate::ai::cloud_environments::ProvidersConfig,
+)> {
+    let RepositoryContract {
+        supports_deferred_repositories,
+        use_factory_repositories,
+    } = repository_contract;
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("Execution configuration requires a task ID")?
+        .parse::<AmbientAgentTaskId>()
+        .context("Invalid execution task ID")?;
+    anyhow::ensure!(
+        config.task_id.inner() == task_id.to_string(),
+        "Execution configuration task mismatch"
+    );
+    let execution_id = args
+        .execution_id
+        .as_deref()
+        .context("Execution configuration requires an execution ID")?;
+    anyhow::ensure!(
+        !execution_id.is_empty() && config.execution_id.inner() == execution_id,
+        "Execution configuration execution mismatch"
+    );
+    let selected_harness = execution_config::harness(&config.harness)?;
+    let model = if selected_harness == Harness::Oz {
+        config
+            .model_id
+            .as_deref()
+            .map(|id| common::validate_agent_mode_base_model_id(id, ctx))
+            .transpose()?
+    } else {
+        None
+    };
+    let third_party_harness_model_config = (selected_harness != Harness::Oz)
+        .then_some(HarnessConfig {
+            harness_type: selected_harness,
+            model_id: config.model_id,
+            reasoning_level: config.reasoning_level,
+        })
+        .and_then(|config| config.model_config());
+    let mcp_specs = execution_config::mcp_specs(&config.mcp_servers_json)?;
+    let repositories = execution_config::repositories(config.repositories)?;
+    let deferred_repositories = if supports_deferred_repositories {
+        execution_config::repositories(
+            config
+                .deferred_repositories
+                .context("Execution configuration is missing deferred repositories")?,
+        )?
+    } else {
+        Vec::new()
+    };
+    let idle_on_complete = execution_config::idle_duration(config.idle_on_complete_seconds)?;
+    let idle_on_fail = execution_config::idle_duration(config.idle_on_fail_seconds)?;
+    if config.skip_initial_turn && idle_on_complete.is_none() {
+        anyhow::bail!("An execution that skips its initial turn requires an idle window");
+    }
+    let providers = execution_config::providers(config.providers);
+    let mut factory_skill_dirs = execution_config::factory_skill_dirs(config.factory_skill_dirs)?;
+    merge_skill_dirs(&mut factory_skill_dirs, skill_discovery_dirs);
+    let task = Task {
+        prompt: AgentRunPrompt::ServerSide {
+            skill: first_skill.map(|skill| skill.parsed_skill),
+            attachments_dir: None,
+        },
+        model,
+        profile: config.profile_id.map(|id| id.into_inner()),
+        mcp_specs,
+        harness: harness_kind(selected_harness, args.harness_transport.unwrap_or_default())?,
+    };
+    let options = AgentDriverOptions {
+        working_dir: working_dir.clone(),
+        task_id: Some(task_id),
+        use_factory_repositories,
+        experimental: None,
+        parent_run_id: config.parent_run_id.map(|id| id.into_inner()),
+        should_share: FeatureFlag::AgentSharedSessions.is_enabled(),
+        idle_on_complete,
+        idle_on_fail,
+        secrets: Default::default(),
+        environment_variables: HashMap::new(),
+        resume: None,
+        cloud_providers: Vec::new(),
+        workspace: {
+            let mut workspace = driver::environment::WorkspaceConfiguration::from_resolved(
+                repositories,
+                deferred_repositories,
+                config.setup_commands,
+            )?;
+            workspace.bind_execution(
+                task_id.to_string(),
+                execution_id.to_owned(),
+                working_dir.clone(),
+                supports_deferred_repositories,
+            )?;
+            workspace.factory_skill_dirs = Some(factory_skill_dirs);
+            workspace
+        },
+        computer_use_config: (selected_harness == Harness::Oz).then(|| {
+            (
+                config.computer_use_enabled,
+                config.computer_use_model_id.map(Into::into),
+            )
+        }),
+        selected_harness,
+        harness_transport: args.harness_transport.unwrap_or_default(),
+        third_party_harness_model_config,
+        team_scope: None,
+        bedrock_oidc_credentials: None,
+        snapshot_disabled: Some(config.snapshot_disabled),
+        snapshot_upload_timeout: args.snapshot.snapshot_upload_timeout.map(Into::into),
+        snapshot_script_timeout: args.snapshot.snapshot_script_timeout.map(Into::into),
+        checkpoint_interval: None,
+        skip_initial_turn: config.skip_initial_turn,
+        strict_mcp_startup: args.strict_mcp_startup,
+        mcp_startup_timeout: args.mcp_startup_timeout.map(Into::into),
+    };
+    Ok((
+        options,
+        task,
+        config.conversation_id.map(|id| id.into_inner()),
+        providers,
+    ))
 }
 
 fn reconcile_task_harness(
     task_id: &str,
     selected_harness: &mut Harness,
     task_harness: Harness,
+    transport: HarnessTransport,
 ) -> Result<HarnessKind, AgentDriverError> {
     if *selected_harness == Harness::Oz {
         *selected_harness = task_harness;
@@ -609,7 +746,7 @@ fn reconcile_task_harness(
         });
     }
 
-    harness_kind(*selected_harness)
+    harness_kind(*selected_harness, transport)
 }
 
 /// Resolve a `Prompt` to a plain string.
@@ -665,10 +802,15 @@ fn run_task(
     }
 }
 
-/// Singleton model that provides a ModelContext for spawning async operations
-/// when starting the agent driver. This is needed because conversation fetching
-/// requires spawning an async task, which requires a ModelContext.
+/// Provides model context for async setup before a normal run or standby creates its agent driver.
 struct AgentDriverRunner;
+struct ExecutionTaskData {
+    server_api: Arc<ServerApi>,
+    config: ExecutionConfiguration,
+    repository_contract: RepositoryContract,
+    secrets: HashMap<String, ManagedSecretValue>,
+    attachments: anyhow::Result<Vec<TaskAttachment>>,
+}
 
 impl warpui::Entity for AgentDriverRunner {
     type Event = ();
@@ -718,19 +860,35 @@ impl AgentDriverRunner {
             setup_events
                 .post_timeline_event(OzRunTimelineEvent::WorkerContainerReady)
                 .await;
+            let execution_id = args.execution_id.as_deref().filter(|id| !id.is_empty());
+            let execution_data = if FeatureFlag::CloudAgentExecutionConfig.is_enabled()
+                && let (Some(task_id), Some(execution_id)) =
+                    (args.task_id.as_deref(), execution_id)
+            {
+                Some(Self::fetch_execution_task_data(&foreground, task_id, execution_id).await?)
+            } else {
+                None
+            };
+            let execution_config = execution_data.as_ref().map(|data| &data.config);
+            let has_execution_config = execution_config.is_some();
 
             // Ensure we've synced team state before starting the driver.
             setup_events
                 .record_result(
                     SetupStep::TeamMetadataRefresh,
-                    Self::refresh_team_metadata(&foreground),
+                    Self::refresh_team_metadata(&foreground, args.task_id.is_some()),
                 )
                 .await?;
-            let args_for_team_scope = args.clone();
-            let agent_driver_team_scope = foreground
-                .spawn(move |_, ctx| resolve_agent_driver_team_scope(&args_for_team_scope, ctx))
-                .await?
-                .map_err(AgentDriverError::ConfigBuildFailed)?;
+            let agent_driver_team_scope = if let Some(config) = execution_config {
+                Some(execution_config::team_scope(config.team_id.as_ref())
+                    .map_err(AgentDriverError::ConfigBuildFailed)?)
+            } else {
+                let args_for_team_scope = args.clone();
+                foreground
+                    .spawn(move |_, ctx| resolve_agent_driver_team_scope(&args_for_team_scope, ctx))
+                    .await?
+                    .map_err(AgentDriverError::ConfigBuildFailed)?
+            };
 
             // Wait for Warp Drive to sync before building the task config, since
             // prompt resolution (SavedPrompt -> workflow lookup) and environment
@@ -750,27 +908,29 @@ impl AgentDriverRunner {
                 .await?;
 
             // Pull relevant variables out of args before moving it into the closure.
-            let share_requests = args.share.share.clone();
-            let bedrock_inference_role = args.bedrock_inference_role.clone();
-            let bedrock_role_region = args.bedrock_role_region.clone();
+            let share_requests = match execution_config {
+                Some(config) => Some(execution_config::sharing_acls(config.session_sharing_acls.clone())
+                    .map_err(AgentDriverError::ConfigBuildFailed)?),
+                None => args.share.share.clone(),
+            };
+            let bedrock_inference_role = match execution_config {
+                Some(config) => config.inference_providers.as_ref()
+                    .and_then(|providers| providers.aws_bedrock.as_ref())
+                    .map(|bedrock| bedrock.role_arn.clone()),
+                None => args.bedrock_inference_role.clone(),
+            };
+            let bedrock_role_region = match execution_config {
+                Some(config) => config.inference_providers.as_ref()
+                    .and_then(|providers| providers.aws_bedrock.as_ref())
+                    .and_then(|bedrock| bedrock.region.clone()),
+                None => args.bedrock_role_region.clone(),
+            };
             let has_task_id = args.task_id.is_some();
-            let args_harness = args.harness;
-            // `--conversation` path (user-invoked local resume): validate before any task side
-            // effects so mismatches fail fast. The `--task-id` path derives its conversation id
-            // from the server-side task metadata inside `build_driver_options_and_task`. Both
-            // can currently be passed together (the worker server-side appends `--conversation`
-            // alongside `--task-id` for Slack/Linear followups); when both are set, the explicit
-            // `--conversation` value wins via the merge below.
-            if !has_task_id
-                && let Some(conversation_id) = args.conversation.as_deref() {
-                    common::fetch_and_validate_conversation_harness(
-                        server_api.clone(),
-                        conversation_id,
-                        args_harness,
-                    )
-                    .await?;
-                }
-            let resume_conversation_id = args.conversation.clone();
+            let resume_conversation_id = if has_execution_config {
+                None
+            } else {
+                args.conversation.clone()
+            };
 
             // Build driver options and task, handling task creation or existing task setup.
             // For the `--task-id` path, `task_conversation_id` is the `conversation_id` read off
@@ -783,6 +943,7 @@ impl AgentDriverRunner {
                     agent_driver_team_scope,
                     &server_api,
                     &setup_events,
+                    execution_data,
                 )
                 .await?;
 
@@ -790,12 +951,17 @@ impl AgentDriverRunner {
             // This only matters if we created a task ID locally.
             task_id = driver_options.task_id.or(task_id);
 
-            // The `--task-id` branch already validated `args_harness` against the task's harness
-            // setting inside `build_driver_options_and_task`; the conversation that the task spawned
-            // necessarily uses the same harness, so no extra conversation-metadata roundtrip is
-            // needed here. Just merge the task's linked conversation id into the resume target.
             let resume_conversation_id = resume_conversation_id.or(task_conversation_id);
-
+            if (has_execution_config || !has_task_id)
+                && let Some(conversation_id) = resume_conversation_id.as_deref()
+            {
+                common::fetch_and_validate_conversation_harness(
+                    server_api.clone(),
+                    conversation_id,
+                    task.harness.harness(),
+                )
+                .await?;
+            }
 
             #[cfg(not(target_family = "wasm"))]
             if let Some(role_arn) = bedrock_inference_role {
@@ -880,9 +1046,9 @@ impl AgentDriverRunner {
                         output_format,
                         share_requests,
                         task,
-                    );
+                    )
                 })
-                .await?;
+                .await??;
 
             Ok(())
         }
@@ -898,10 +1064,27 @@ impl AgentDriverRunner {
 
     async fn refresh_team_metadata(
         foreground: &ModelSpawner<Self>,
+        cloud_startup: bool,
     ) -> Result<(), AgentDriverError> {
         foreground
             .spawn(
-                |_, ctx| -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+                move |_, ctx| -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+                    #[cfg(not(target_family = "wasm"))]
+                    if cloud_startup {
+                        return Box::pin(TeamUpdateManager::handle(ctx).update(
+                            ctx,
+                            |manager, ctx| {
+                                manager.refresh_workspace_metadata_with_retry(
+                                    WorkspaceMetadataRetryPolicy::TimeBudget(Duration::from_secs(
+                                        30,
+                                    )),
+                                    ctx,
+                                )
+                            },
+                        ));
+                    }
+                    #[cfg(target_family = "wasm")]
+                    let _ = cloud_startup;
                     Box::pin(common::refresh_workspace_metadata(ctx))
                 },
             )
@@ -929,9 +1112,68 @@ impl AgentDriverRunner {
         Ok(())
     }
 
+    async fn fetch_execution_task_data(
+        foreground: &ModelSpawner<Self>,
+        task_id: &str,
+        execution_id: &str,
+    ) -> Result<ExecutionTaskData, AgentDriverError> {
+        let supports_deferred_repositories = FeatureFlag::FactoryDeferredRepositories.is_enabled();
+        let use_factory_repositories =
+            factory_repository_contract(task_id.parse().ok(), supports_deferred_repositories);
+        let (workload_token, no_isolation) =
+            match warp_isolation_platform::issue_workload_token(Some(Duration::from_mins(5))).await
+            {
+                Ok(token) => (token.token, false),
+                Err(IsolationPlatformError::NoIsolationPlatformDetected) => (String::new(), true),
+                Err(error) => return Err(AgentDriverError::SecretsFetchFailed(error.into())),
+            };
+        let api = foreground
+            .spawn(|_, ctx| ServerApiProvider::as_ref(ctx).get())
+            .await?;
+        let data = with_retry(
+            "Execution bootstrap",
+            || {
+                api.get_execution_bootstrap(
+                    task_id,
+                    execution_id,
+                    workload_token.clone(),
+                    supports_deferred_repositories,
+                )
+            },
+            retry::is_transient_graphql_or_http_error,
+            |delay| async move {
+                warpui::r#async::Timer::after(delay).await;
+            },
+            |attempts_made| match attempts_made {
+                0 => Some(Duration::from_millis(250)),
+                1 => Some(Duration::from_secs(1)),
+                _ => None,
+            },
+        )
+        .await
+        .map_err(AgentDriverError::ConfigBuildFailed)?;
+        let secrets = if no_isolation {
+            HashMap::new()
+        } else {
+            convert_task_secrets(data.secrets.map_err(AgentDriverError::SecretsFetchFailed)?)
+                .map_err(AgentDriverError::SecretsFetchFailed)?
+        };
+        Ok(ExecutionTaskData {
+            server_api: api,
+            config: data.config,
+            repository_contract: RepositoryContract {
+                supports_deferred_repositories,
+                use_factory_repositories,
+            },
+            secrets,
+            attachments: data.attachments,
+        })
+    }
+
     async fn fetch_task_git_credentials(
         task_id_str: String,
         ai_client: Arc<dyn AIClient>,
+        use_factory_repositories: bool,
     ) -> Result<Vec<GitCredential>, TaskGitCredentialsError> {
         with_retry(
             "Git credentials bootstrap",
@@ -948,7 +1190,12 @@ impl AgentDriverRunner {
                     .map_err(|error| TaskGitCredentialsError::Request(error.into()))?
                     .token;
                     let response = ai_client
-                        .get_task_git_credentials(task_id_str, workload_token, false)
+                        .get_task_git_credentials(
+                            task_id_str,
+                            workload_token,
+                            false,
+                            use_factory_repositories,
+                        )
                         .await?;
                     driver::git_credentials::credentials_for_bootstrap(response)
                         .map_err(TaskGitCredentialsError::Request)
@@ -971,6 +1218,7 @@ impl AgentDriverRunner {
         foreground: &ModelSpawner<Self>,
         task_id_str: &str,
         args: &RunAgentArgs,
+        use_factory_repositories: bool,
     ) -> Result<(), AgentDriverError> {
         // The gh CLI only covers github.com, so this must not replace the
         // server fetch below — other forges (GitLab, Azure DevOps) get their
@@ -1020,6 +1268,7 @@ impl AgentDriverRunner {
         let credentials = match Self::fetch_task_git_credentials(
             task_id_str.clone(),
             Arc::clone(&ai_client),
+            use_factory_repositories,
         )
         .await
         {
@@ -1089,38 +1338,15 @@ impl AgentDriverRunner {
             return Ok(None);
         };
 
-        // In sandboxed mode with a fully-qualified spec, clone the repo first.
-        let needs_clone = args.sandboxed && skill_spec.org.is_some() && skill_spec.repo.is_some();
-        if needs_clone {
-            let org = skill_spec.org.as_ref().expect("org checked above");
-            let repo_name = skill_spec.repo.as_ref().expect("repo checked above");
-            log::info!("Cloning {org}/{repo_name} for skill resolution in sandboxed mode");
-            setup_events
-                .record_result(SetupStep::SkillRepoClone, async {
-                    clone_repo_for_skill(org, repo_name, working_dir)
-                        .await
-                        .map_err(|err| {
-                            AgentDriverError::SkillResolutionFailed(format_skill_resolution_error(
-                                err,
-                            ))
-                        })
-                })
-                .await?;
-        }
-
-        let working_dir_buf = working_dir.to_path_buf();
-        let skill = foreground
-            .spawn(move |_, ctx| resolve_skill_spec(&skill_spec, &working_dir_buf, ctx))
-            .await?
-            .map_err(|err| {
-                AgentDriverError::SkillResolutionFailed(format_skill_resolution_error(err))
-            })?;
-        log::debug!(
-            "Resolved skill '{}' from {}",
-            skill.name,
-            skill.skill_path.display()
-        );
-        Ok(Some(skill))
+        configured_skills::resolve_skill(
+            foreground,
+            skill_spec,
+            args.sandboxed,
+            working_dir,
+            setup_events,
+        )
+        .await
+        .map(Some)
     }
 
     /// Build the AgentDriverOptions and Task, handling task creation or existing task setup.
@@ -1135,6 +1361,7 @@ impl AgentDriverRunner {
         agent_driver_team_scope: Option<HeadlessTeamScope>,
         server_api: &Arc<dyn AIClient>,
         setup_events: &SetupClientEventReporter,
+        execution_data: Option<ExecutionTaskData>,
     ) -> Result<(AgentDriverOptions, Task, Option<String>), AgentDriverError> {
         // Get the working directory
         let working_dir = match args.cwd.as_ref() {
@@ -1144,8 +1371,93 @@ impl AgentDriverRunner {
         }
         .map_err(AgentDriverError::ConfigBuildFailed)?;
 
+        let use_factory_repositories = execution_data
+            .as_ref()
+            .map(|data| data.repository_contract.use_factory_repositories)
+            .unwrap_or_else(|| {
+                factory_repository_contract(
+                    args.task_id.as_deref().and_then(|id| id.parse().ok()),
+                    FeatureFlag::FactoryDeferredRepositories.is_enabled(),
+                )
+            });
         if let Some(task_id_str) = args.task_id.as_ref() {
-            Self::bootstrap_git_credentials_for_task(foreground, task_id_str, &args).await?;
+            Self::bootstrap_git_credentials_for_task(
+                foreground,
+                task_id_str,
+                &args,
+                use_factory_repositories,
+            )
+            .await?;
+        }
+        if let Some(ExecutionTaskData {
+            server_api: execution_server_api,
+            config,
+            repository_contract,
+            secrets,
+            attachments,
+        }) = execution_data
+        {
+            let specs = config
+                .skills
+                .iter()
+                .map(|entry| {
+                    entry
+                        .spec
+                        .parse::<SkillSpec>()
+                        .map_err(AgentDriverError::SkillResolutionFailed)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (first_skill, skill_discovery_dirs) = configured_skills::resolve_configured_skills(
+                foreground,
+                specs,
+                args.sandboxed,
+                &working_dir,
+                setup_events,
+            )
+            .await?;
+            let (mut options, mut task, conversation_id, providers) = foreground
+                .spawn(move |_, ctx| {
+                    build_execution_task_and_options(
+                        &args,
+                        config,
+                        repository_contract,
+                        working_dir,
+                        first_skill,
+                        skill_discovery_dirs,
+                        ctx,
+                    )
+                })
+                .await?
+                .map_err(AgentDriverError::ConfigBuildFailed)?;
+            options.team_scope = agent_driver_team_scope;
+            let task_id = options
+                .task_id
+                .ok_or(AgentDriverError::InvalidRuntimeState)?;
+            setup_events
+                .record_result(
+                    SetupStep::TaskDataFetch,
+                    Self::prepare_execution_task_data(
+                        execution_server_api,
+                        server_api,
+                        task_id,
+                        secrets,
+                        attachments,
+                        &mut options,
+                        &mut task,
+                    ),
+                )
+                .await?;
+            if FeatureFlag::OzIdentityFederation.is_enabled() {
+                options.cloud_providers = driver::cloud_provider::load_providers(
+                    &providers,
+                    &options
+                        .task_id
+                        .ok_or(AgentDriverError::InvalidRuntimeState)?
+                        .to_string(),
+                )
+                .map_err(AgentDriverError::CloudProviderSetupFailed)?;
+            }
+            return Ok((options, task, conversation_id));
         }
         // Resolve the skill, if we have one
         let resolved_skill =
@@ -1158,7 +1470,14 @@ impl AgentDriverRunner {
 
         // Build the AgentConfigSnapshot, Task, and AgentDriverOptions
         let prompt_clone = prompt.clone();
-        let (merged_config, mut task, mut driver_options, agent_driver_team_scope) = foreground
+        let (
+            merged_config,
+            mut task,
+            mut driver_options,
+            agent_driver_team_scope,
+            repository_preparation_overrides,
+            remove_repository_origins,
+        ) = foreground
             .spawn(move |_, ctx| -> anyhow::Result<_> {
                 let (merged_config, task) = build_merged_config_and_task(
                     &args,
@@ -1179,19 +1498,20 @@ impl AgentDriverRunner {
                 let driver_options = driver::AgentDriverOptions {
                     working_dir: working_dir.clone(),
                     task_id,
+                    use_factory_repositories,
                     experimental: None,
                     parent_run_id: None,
                     should_share,
                     idle_on_complete: args.idle_on_complete.map(|d| d.into()),
-                    idle_on_fail: args.idle_on_fail.map(|d| d.into()),
+                    idle_on_fail: args.effective_idle_on_fail().map(|d| d.into()),
                     secrets: Default::default(),
+                    environment_variables: HashMap::new(),
                     resume: None,
                     cloud_providers: Vec::new(),
-                    environment: None,
-                    additional_source_repos: Vec::new(),
-                    repository_preparation_overrides: args.repository_preparation_overrides.clone(),
-                    remove_repository_origins: args.remove_repository_origins,
+                    workspace: driver::environment::WorkspaceConfiguration::default(),
+                    computer_use_config: None,
                     selected_harness: args.harness,
+                    harness_transport: args.harness_transport.unwrap_or_default(),
                     third_party_harness_model_config,
                     team_scope: None,
                     bedrock_oidc_credentials: None,
@@ -1210,7 +1530,14 @@ impl AgentDriverRunner {
                     mcp_startup_timeout: args.mcp_startup_timeout.map(|duration| duration.into()),
                 };
 
-                Ok((merged_config, task, driver_options, agent_driver_team_scope))
+                Ok((
+                    merged_config,
+                    task,
+                    driver_options,
+                    agent_driver_team_scope,
+                    args.repository_preparation_overrides,
+                    args.remove_repository_origins,
+                ))
             })
             .await?
             .map_err(AgentDriverError::ConfigBuildFailed)?;
@@ -1220,7 +1547,8 @@ impl AgentDriverRunner {
         // Handle secrets/attachments fetch (existing task) or task creation (new run).
         // The existing-task branch also surfaces the task's `conversation_id` (if any) so
         // the caller can wire up resume without a separate `--conversation` arg.
-        let task_conversation_id = if let Some(task_id_str) = task_id_str {
+        let (task_conversation_id, additional_source_repos) = if let Some(task_id_str) = task_id_str
+        {
             driver_options.team_scope = agent_driver_team_scope;
             setup_events
                 .record_result(
@@ -1256,16 +1584,21 @@ impl AgentDriverRunner {
                 &mut driver_options,
             )
             .await?;
-            None
+            (None, Vec::new())
         };
         // Resolve environment and cloud providers.
-        setup_events
+        let environment = setup_events
             .record_result(
                 SetupStep::EnvironmentResolution,
                 Self::resolve_environment(foreground, environment_id, &mut driver_options),
             )
             .await?;
-        validated_driver_repositories_for_preparation(&driver_options)?;
+        driver_options.workspace = driver::environment::WorkspaceConfiguration::from_legacy(
+            environment.as_ref(),
+            additional_source_repos,
+            repository_preparation_overrides,
+            remove_repository_origins,
+        )?;
 
         Ok((driver_options, task, task_conversation_id))
     }
@@ -1294,7 +1627,14 @@ impl AgentDriverRunner {
         };
 
         let task_id = match server_api
-            .create_agent_task(prompt, environment, None, task_config, request_team_scope)
+            .create_agent_task(
+                prompt,
+                environment,
+                None,
+                task_config,
+                HashMap::new(),
+                request_team_scope,
+            )
             .await
             .context("Failed to create task")
         {
@@ -1316,8 +1656,73 @@ impl AgentDriverRunner {
         Ok(())
     }
 
-    /// When starting an agent run from an existing task_id, fetch secrets, task metadata,
-    /// and task attachments (images and files) from the server and update the driver options.
+    /// Downloads regular and handoff attachments independently before the run begins.
+    async fn prepare_execution_task_data(
+        server_api: Arc<ServerApi>,
+        ai_client: &Arc<dyn AIClient>,
+        task_id: AmbientAgentTaskId,
+        secrets: HashMap<String, ManagedSecretValue>,
+        attachments: anyhow::Result<Vec<TaskAttachment>>,
+        driver_options: &mut AgentDriverOptions,
+        task: &mut Task,
+    ) -> Result<(), AgentDriverError> {
+        let attachments_dir = attachments_download_dir(&driver_options.working_dir);
+        let regular = async {
+            match attachments {
+                Ok(attachments) => {
+                    driver::attachments::download_attachments(
+                        attachments,
+                        server_api.clone(),
+                        attachments_dir.clone(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let handoff = async {
+            if !FeatureFlag::OzHandoff.is_enabled() {
+                return Ok(None);
+            }
+            driver::attachments::fetch_and_download_handoff_snapshot_attachments(
+                ai_client.clone(),
+                server_api.external_http_client(),
+                task_id,
+                attachments_dir.clone(),
+            )
+            .await
+        };
+        let (regular_result, handoff_result) = futures::join!(regular, handoff);
+        let mut attachments_dir = match regular_result {
+            Ok(downloads) => {
+                task.harness.set_initial_attachments(downloads.files);
+                downloads.directory
+            }
+            Err(error) => {
+                log::warn!("Failed to fetch and download attachments: {error:#}");
+                None
+            }
+        };
+        match handoff_result {
+            Ok(Some(dir)) => {
+                attachments_dir.get_or_insert(dir);
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("Failed to fetch handoff snapshot attachments: {error:#}"),
+        }
+        driver_options.secrets = secrets;
+        if let AgentRunPrompt::ServerSide {
+            attachments_dir: ref mut dir,
+            ..
+        } = task.prompt
+        {
+            *dir = attachments_dir;
+        }
+        Ok(())
+    }
+
+    /// For task-only launches, fetch secrets, task metadata, and task attachments (images and
+    /// files) from the server and update the driver options.
     ///
     /// Returns the task's `conversation_id` when the server has linked the task to an existing
     /// AI conversation (e.g. a `run-cloud --conversation` spawn). The caller uses this to drive
@@ -1328,7 +1733,7 @@ impl AgentDriverRunner {
         task_id_str: String,
         driver_options: &mut AgentDriverOptions,
         task: &mut Task,
-    ) -> Result<Option<String>, AgentDriverError> {
+    ) -> Result<(Option<String>, Vec<SourceRepo>), AgentDriverError> {
         let (task_secrets, server_api) = foreground
             .spawn({
                 let task_id_str = task_id_str.clone();
@@ -1383,7 +1788,7 @@ impl AgentDriverRunner {
             };
             driver::attachments::fetch_and_download_handoff_snapshot_attachments(
                 handoff_snapshot_ai_client,
-                handoff_snapshot_server_api.http_client(),
+                handoff_snapshot_server_api.external_http_client(),
                 task_id_parsed,
                 handoff_snapshot_download_dir,
             )
@@ -1402,14 +1807,14 @@ impl AgentDriverRunner {
             handoff_snapshot,
         );
 
-        // Extract attachments_dir from successful result, log errors
-        let mut attachments_dir = match attachments_result {
-            Ok(dir) => dir,
+        let downloads = match attachments_result {
+            Ok(downloads) => downloads,
             Err(e) => {
                 log::warn!("Failed to fetch and download attachments: {e:#}");
-                None
+                driver::attachments::TaskAttachmentDownloads::default()
             }
         };
+        let mut attachments_dir = downloads.directory;
 
         match handoff_snapshot_result {
             Ok(Some(dir)) => {
@@ -1503,13 +1908,14 @@ impl AgentDriverRunner {
                 &task_id_str,
                 &mut driver_options.selected_harness,
                 task_harness,
+                driver_options.harness_transport,
             )?;
         }
+        task.harness.set_initial_attachments(downloads.files);
 
         driver_options.task_id = parsed_task_id;
         driver_options.parent_run_id = parent_run_id;
         driver_options.experimental = experimental;
-        driver_options.additional_source_repos = additional_source_repos;
         driver_options.secrets = secrets;
         // The server-reported task scope is authoritative for the headless window this run
         // creates; it supersedes whatever scope was resolved from CLI args before the task was
@@ -1531,7 +1937,7 @@ impl AgentDriverRunner {
             *dir = attachments_dir;
         }
 
-        Ok(task_conversation_id)
+        Ok((task_conversation_id, additional_source_repos))
     }
 
     /// If we are starting this agent run from an existing conversation, load the conversation
@@ -1541,11 +1947,12 @@ impl AgentDriverRunner {
     /// `harness` is the resolved harness from the task config (already validated against the
     /// conversation's metadata up-front by [`common::fetch_and_validate_conversation_harness`]).
     ///
-    /// For the Oz harness, fetches the full conversation and returns a [`driver::ResumeOptions::Oz`].
-    /// For third-party harnesses, delegates to [`ThirdPartyHarness::fetch_resume_payload`] and
-    /// wraps the returned payload (if any) in [`driver::ResumeOptions::ThirdParty`]; each harness
-    /// owns its server call and error mapping. Returns `None` if a third-party harness has no
-    /// resume payload to surface.
+    /// For harnesses that render through a native conversation (Oz, and third-party harnesses
+    /// driven over ACP), fetches the full conversation and returns a
+    /// [`driver::ResumeOptions::Native`] restoration. Otherwise, delegates to
+    /// [`ThirdPartyHarness::fetch_resume_payload`] and wraps the returned payload (if any) in
+    /// [`driver::ResumeOptions::ThirdParty`]; each harness owns its server call and error
+    /// mapping. Returns `None` if a third-party harness has no resume payload to surface.
     #[tracing::instrument(skip_all, err, fields(tags.cloud_agent = true, conversation_id = conversation_id))]
     async fn load_conversation_information(
         foreground: &ModelSpawner<Self>,
@@ -1553,57 +1960,58 @@ impl AgentDriverRunner {
         harness: &HarnessKind,
     ) -> Result<Option<driver::ResumeOptions>, AgentDriverError> {
         match harness {
-            HarnessKind::Oz => {
-                let server_api = foreground
-                    .spawn(|_, ctx| {
-                        ServerApiProvider::handle(ctx)
-                            .as_ref(ctx)
-                            .get_ai_client()
-                            .clone()
-                    })
-                    .await?;
-                let token = ServerConversationToken::new(conversation_id.clone());
-                let (conversation_data, metadata) = server_api
-                    .get_ai_conversation(token)
-                    .await
-                    .map_err(|err| AgentDriverError::ConversationLoadFailed(format!("{err}")))?;
-                let conversation = convert_conversation_data_to_ai_conversation(
-                    AIConversationId::default(),
-                    &conversation_data,
-                    metadata,
-                    RestorationMode::Continue,
-                )
-                .ok_or_else(|| {
-                    AgentDriverError::ConversationLoadFailed(
-                        "Failed to convert conversation data to AIConversation".into(),
-                    )
-                })?;
-                Ok(Some(driver::ResumeOptions::Oz(Box::new(
-                    ConversationRestorationInNewPaneType::Historical {
-                        conversation,
-                        should_use_live_appearance: false,
-                        ambient_agent_task_id: None,
-                    },
-                ))))
+            HarnessKind::Unsupported(harness) => {
+                return Err(AgentDriverError::HarnessSetupFailed {
+                    harness: harness.to_string(),
+                    reason: format!(
+                        "The {harness} harness is only supported for local child agent launches."
+                    ),
+                });
             }
-            HarnessKind::ThirdParty(h) => {
+            HarnessKind::ThirdParty(h) if h.drives_cli_agent_session() => {
                 let harness_support_client = foreground
                     .spawn(|_, ctx| ServerApiProvider::as_ref(ctx).get_harness_support_client())
                     .await?;
                 let resume_conversation_id = ServerConversationToken::new(conversation_id.clone());
-                Ok(
-                    h.fetch_resume_payload(&resume_conversation_id, harness_support_client)
-                        .await?
-                        .map(|payload| driver::ResumeOptions::ThirdParty(Box::new(payload))),
-                )
+                return Ok(h
+                    .fetch_resume_payload(&resume_conversation_id, harness_support_client)
+                    .await?
+                    .map(|payload| driver::ResumeOptions::ThirdParty(Box::new(payload))));
             }
-            HarnessKind::Unsupported(harness) => Err(AgentDriverError::HarnessSetupFailed {
-                harness: harness.to_string(),
-                reason: format!(
-                    "The {harness} harness is only supported for local child agent launches."
-                ),
-            }),
+            HarnessKind::Oz | HarnessKind::ThirdParty(_) => {}
         }
+
+        let server_api = foreground
+            .spawn(|_, ctx| {
+                ServerApiProvider::handle(ctx)
+                    .as_ref(ctx)
+                    .get_ai_client()
+                    .clone()
+            })
+            .await?;
+        let token = ServerConversationToken::new(conversation_id.clone());
+        let (conversation_data, metadata) = server_api
+            .get_ai_conversation(token)
+            .await
+            .map_err(|err| AgentDriverError::ConversationLoadFailed(format!("{err}")))?;
+        let conversation = convert_conversation_data_to_ai_conversation(
+            AIConversationId::default(),
+            &conversation_data,
+            metadata,
+            RestorationMode::Continue,
+        )
+        .ok_or_else(|| {
+            AgentDriverError::ConversationLoadFailed(
+                "Failed to convert conversation data to AIConversation".into(),
+            )
+        })?;
+        Ok(Some(driver::ResumeOptions::Native(Box::new(
+            ConversationRestorationInNewPaneType::Historical {
+                conversation,
+                should_use_live_appearance: false,
+                ambient_agent_task_id: None,
+            },
+        ))))
     }
 
     /// Resolve the environment and store into `driver_options`.
@@ -1612,9 +2020,9 @@ impl AgentDriverRunner {
         foreground: &ModelSpawner<Self>,
         environment_id: Option<String>,
         driver_options: &mut AgentDriverOptions,
-    ) -> Result<(), AgentDriverError> {
+    ) -> Result<Option<AmbientAgentEnvironment>, AgentDriverError> {
         let Some(environment_id) = environment_id else {
-            return Ok(());
+            return Ok(None);
         };
 
         let environment = foreground
@@ -1652,8 +2060,7 @@ impl AgentDriverRunner {
                     .map_err(AgentDriverError::CloudProviderSetupFailed)?;
         }
 
-        driver_options.environment = Some(environment);
-        Ok(())
+        Ok(Some(environment))
     }
 
     /// Create the AgentDriver and start running the task.
@@ -1664,14 +2071,9 @@ impl AgentDriverRunner {
         output_format: OutputFormat,
         share_requests: Option<Vec<ShareRequest>>,
         task: driver::Task,
-    ) {
+    ) -> Result<(), AgentDriverError> {
         maybe_warn_team_api_key(ctx);
-
-        // Initializing the driver will fail if not logged in. Since we check that above, panic here - it's difficult to
-        // fallibly instantiate a UI framework model.
-        let driver = ctx.add_singleton_model(|ctx| {
-            AgentDriver::new(driver_options, ctx).expect("Could not initialize driver")
-        });
+        let driver = AgentDriver::create(driver_options, ctx)?;
 
         driver.update(ctx, |driver, ctx| {
             driver.set_output_format(output_format);
@@ -1693,6 +2095,7 @@ impl AgentDriverRunner {
                 }
             });
         });
+        Ok(())
     }
 }
 
@@ -1719,6 +2122,7 @@ fn command_requires_auth(command: &CliCommand) -> bool {
         CliCommand::Agent(agent_cmd) => match agent_cmd {
             AgentCommand::Run { .. } => true,
             AgentCommand::RunCloud { .. } => true,
+            AgentCommand::RunCloudStandby { .. } => true,
             AgentCommand::Profile(sub) => match sub {
                 AgentProfileCommand::List => true,
             },
@@ -1750,6 +2154,7 @@ fn command_requires_auth(command: &CliCommand) -> bool {
             ModelCommand::List(_) => true,
         },
         CliCommand::MemoryStore(_) => true,
+        CliCommand::EnvironmentCheckout(_) => false,
         CliCommand::Memory(_) => true,
         CliCommand::Login => false,
         CliCommand::Logout => false,
@@ -1931,6 +2336,7 @@ fn resolve_orchestration_harness_label() -> &'static str {
         Some(Harness::Claude) => "claude",
         Some(Harness::OpenCode) => "opencode",
         Some(Harness::Gemini) => "gemini",
+        Some(Harness::Pi) => "pi",
         Some(Harness::Codex) => "codex",
         Some(Harness::Unknown) | None => "unknown",
     }
@@ -1947,6 +2353,9 @@ fn command_to_telemetry_event(command: &CliCommand) -> CliTelemetryEvent {
             harness: args.harness.to_string(),
         },
         CliCommand::Agent(AgentCommand::RunCloud(_)) => CliTelemetryEvent::AgentRunAmbient,
+        CliCommand::Agent(AgentCommand::RunCloudStandby(_)) => {
+            CliTelemetryEvent::AgentRunCloudStandby
+        }
         CliCommand::Agent(AgentCommand::Profile(sub)) => match sub {
             AgentProfileCommand::List => CliTelemetryEvent::AgentProfileList,
         },
@@ -1975,6 +2384,7 @@ fn command_to_telemetry_event(command: &CliCommand) -> CliTelemetryEvent {
             CliTelemetryEvent::EnvironmentImageList
         }
         CliCommand::MCP(MCPCommand::List) => CliTelemetryEvent::MCPList,
+        CliCommand::EnvironmentCheckout(_) => CliTelemetryEvent::EnvironmentCheckout,
         CliCommand::Run(TaskCommand::List(_)) => CliTelemetryEvent::TaskList,
         CliCommand::Run(TaskCommand::Get(args)) => {
             if args.conversation {

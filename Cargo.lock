@@ -347,6 +347,7 @@ dependencies = [
  "notify-debouncer-full",
  "persistence",
  "priority-queue",
+ "prost",
  "prost-types",
  "rand 0.8.6",
  "rayon",
@@ -3297,6 +3298,7 @@ dependencies = [
  "objc2-core-graphics",
  "pathfinder_geometry",
  "serde",
+ "serde_json",
  "serde_with",
  "tempfile",
  "thiserror 2.0.17",
@@ -12008,9 +12010,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.14"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0527518605e68109d875e248ea259b6758801cf165e4b2c2733ae3b51f12535a"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -15817,6 +15819,7 @@ dependencies = [
  "notify-debouncer-full",
  "remote_server",
  "repo_metadata",
+ "same-file",
  "tempfile",
  "thiserror 2.0.17",
  "warp_core",
@@ -15844,6 +15847,7 @@ dependencies = [
  "persistence",
  "reqwest",
  "serde",
+ "serde_json",
  "thiserror 2.0.17",
  "warp_core",
  "warp_errors",
@@ -15941,7 +15945,7 @@ dependencies = [
 [[package]]
 name = "warp_multi_agent_api"
 version = "0.0.0"
-source = "git+https://github.com/warpdotdev/warp-proto-apis.git?rev=aad8b601abc02256ce6ea9648ff598ed0139a265#aad8b601abc02256ce6ea9648ff598ed0139a265"
+source = "git+https://github.com/warpdotdev/warp-proto-apis.git?rev=c5aa18336af009426711f997591480d701280cf2#c5aa18336af009426711f997591480d701280cf2"
 dependencies = [
  "prost",
  "prost-reflect",
@@ -16052,6 +16056,7 @@ dependencies = [
  "bincode",
  "blocking",
  "bounded-vec-deque",
+ "bytes",
  "cfg-if",
  "chrono",
  "cloud_object_client",

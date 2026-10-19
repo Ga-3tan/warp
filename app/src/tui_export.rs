@@ -286,13 +286,15 @@ pub use crate::workspaces::user_workspaces::{
     ResolvedTeamScope, TeamContext, TeamContextForOperation, TeamContextResolver, TeamScope,
     UserWorkspaces, UserWorkspacesEvent,
 };
-pub use crate::workspaces::workspace::{AiCreditsUsageAndCostType, UsageVisibilityGranularity};
+pub use crate::workspaces::workspace::{
+    AiCreditsUsageAndCostType, ChargeUnit, UsageVisibilityGranularity,
+};
 
-pub fn format_usage_cost_cents(cents: i64) -> String {
+pub fn format_usage_cost_cents(cents: f64) -> String {
     crate::settings_view::format_cost_cents(cents)
 }
 
-pub fn format_usage_credits(credits: i64) -> String {
+pub fn format_usage_credits(credits: f64) -> String {
     crate::settings_view::format_credits(credits)
 }
 
