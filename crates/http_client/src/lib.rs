@@ -33,7 +33,7 @@ pub mod headers {
     /// Custom Warp header indicating the version of the Warp app.
     pub const CLIENT_RELEASE_VERSION_HEADER_KEY: &str = "X-Warp-Client-Version";
     /// The original body size before request compression, used for early server size rejection.
-    pub const UNCOMPRESSED_CONTENT_LENGTH: &str = "X-Warp-Uncompressed-Content-Length";
+    pub const UNCOMPRESSED_CONTENT_LENGTH: &str = "X-Uncompressed-Content-Length";
 
     /// Custom Warp header indicating the OS category the request was sent from.
     pub(crate) const WARP_OS_CATEGORY: &str = "X-Warp-OS-Category";

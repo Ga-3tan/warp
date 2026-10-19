@@ -34,7 +34,7 @@ fn gzip_protobuf_preserves_wire_contract() {
     );
     assert_eq!(request.headers()[http::header::CONTENT_ENCODING], "gzip");
     assert_eq!(
-        request.headers()[headers::UNCOMPRESSED_CONTENT_LENGTH],
+        request.headers()["X-Uncompressed-Content-Length"],
         expected.encoded_len().to_string()
     );
     let clone = request.try_clone().unwrap();
