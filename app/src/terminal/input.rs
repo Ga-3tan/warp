@@ -7867,7 +7867,8 @@ impl Input {
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         let shared_session_status = self.model.lock().shared_session_status().clone();
-        if shared_session_status.is_sharer_or_viewer() {
+        if shared_session_status.is_sharer_or_viewer() && !shared_session_status.is_share_pending()
+        {
             // If this is a viewer who isn't also an executor, they should not
             // be allowed to execute commands.
             if shared_session_status.is_reader() {
