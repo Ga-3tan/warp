@@ -145,18 +145,11 @@ fn pending_ctrl_t_handoff() -> PendingShellWidgetHandoff {
         cursor_offset: Some(ByteOffset::from(5)),
     }
 }
-#[derive(Debug, PartialEq, Eq)]
-enum RecordedCommandSource {
-    User,
-    QueuedCommand,
-    SharedSession(ParticipantId),
-    Other,
-}
 
 fn subscribe_to_execute_command_events(
     app: &mut App,
     terminal: &warpui::ViewHandle<TerminalView>,
-) -> Rc<RefCell<Vec<(String, RecordedCommandSource)>>> {
+) -> Rc<RefCell<Vec<(String, CommandExecutionSource)>>> {
     let events = Rc::new(RefCell::new(Vec::new()));
     let events_for_subscription = events.clone();
     app.update(|ctx| {
@@ -164,123 +157,132 @@ fn subscribe_to_execute_command_events(
             let TerminalViewEvent::ExecuteCommand(event) = event else {
                 return;
             };
-            let source = match &event.source {
-                CommandExecutionSource::User => RecordedCommandSource::User,
-                CommandExecutionSource::QueuedCommand => RecordedCommandSource::QueuedCommand,
-                CommandExecutionSource::SharedSession { participant_id, .. } => {
-                    RecordedCommandSource::SharedSession(participant_id.clone())
-                }
-                CommandExecutionSource::AI { .. }
-                | CommandExecutionSource::EnvVarCollection { .. } => RecordedCommandSource::Other,
-            };
             events_for_subscription
                 .borrow_mut()
-                .push((event.command.clone(), source));
+                .push((event.command.clone(), event.source.clone()));
         });
     });
     events
 }
 
 #[test]
-fn pending_session_creator_executes_setup_commands_locally() {
+fn unshared_terminal_executes_command_locally() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let events = subscribe_to_execute_command_events(&mut app, &terminal);
+
+        assert!(input.update(&mut app, |input, ctx| {
+            input.try_execute_command("echo local", ctx)
+        }));
+        assert_eventually!(
+            600 => events.borrow().len() == 1,
+            "a local command should reach the terminal surface"
+        );
+        let events = events.borrow();
+        assert_eq!(events[0].0, "echo local");
+        assert!(matches!(&events[0].1, CommandExecutionSource::User));
+    });
+}
+
+#[test]
+fn share_pending_creator_executes_setup_command_locally() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
 
-        let local_terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
-        let pending_terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
-        let prebootstrap_terminal =
-            add_window_with_bootstrapped_terminal(&mut app, None, None).await;
-        let queued_terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
-        pending_terminal.update(&mut app, |view, _| {
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        terminal.update(&mut app, |view, _| {
             view.model
                 .lock()
                 .set_shared_session_status(SharedSessionStatus::SharePending);
         });
-        prebootstrap_terminal.update(&mut app, |view, _| {
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.read(&app, |input, _| {
+            assert!(input.shared_session_presence_manager.is_none());
+        });
+        let events = subscribe_to_execute_command_events(&mut app, &terminal);
+
+        assert!(input.update(&mut app, |input, ctx| {
+            input.try_execute_command("echo setup", ctx)
+        }));
+        assert_eventually!(
+            600 => events.borrow().len() == 1,
+            "a pending sharer's setup command should reach the terminal surface"
+        );
+        let events = events.borrow();
+        assert_eq!(events[0].0, "echo setup");
+        assert!(matches!(&events[0].1, CommandExecutionSource::User));
+    });
+}
+
+#[test]
+fn prebootstrap_share_status_uses_local_path_when_shell_is_ready() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        terminal.update(&mut app, |view, _| {
             view.model.lock().set_shared_session_status(
                 SharedSessionStatus::SharePendingPreBootstrap {
                     source: SharedSessionSource::ambient_agent(None),
                 },
             );
         });
-        queued_terminal.update(&mut app, |view, _| {
-            view.model
-                .lock()
-                .set_shared_session_status(SharedSessionStatus::SharePending);
-        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let events = subscribe_to_execute_command_events(&mut app, &terminal);
 
-        let local_input = local_terminal.read(&app, |view, _| view.input().clone());
-        let pending_input = pending_terminal.read(&app, |view, _| view.input().clone());
-        let prebootstrap_input = prebootstrap_terminal.read(&app, |view, _| view.input().clone());
-        let queued_input = queued_terminal.read(&app, |view, _| view.input().clone());
-        for input in [&pending_input, &prebootstrap_input] {
-            input.read(&app, |input, _| {
-                assert!(
-                    input.shared_session_presence_manager.is_none(),
-                    "presence manager is not installed while session creation is pending"
-                );
-            });
-        }
-
-        let local_events = subscribe_to_execute_command_events(&mut app, &local_terminal);
-        let pending_events = subscribe_to_execute_command_events(&mut app, &pending_terminal);
-        let prebootstrap_events =
-            subscribe_to_execute_command_events(&mut app, &prebootstrap_terminal);
-        let queued_events = subscribe_to_execute_command_events(&mut app, &queued_terminal);
-
-        assert!(local_input.update(&mut app, |input, ctx| {
-            input.try_execute_command("echo local", ctx)
-        }));
-        assert!(pending_input.update(&mut app, |input, ctx| {
+        assert!(input.update(&mut app, |input, ctx| {
             input.try_execute_command("echo setup", ctx)
         }));
-        assert!(prebootstrap_input.update(&mut app, |input, ctx| {
-            input.try_execute_command("echo prebootstrap pending", ctx)
-        }));
-        assert!(queued_input.update(&mut app, |input, ctx| {
-            input.try_execute_command_with_options("echo queued", true, ctx)
-        }));
-
         assert_eventually!(
-            600 => local_events.borrow().len() == 1
-                && pending_events.borrow().len() == 1
-                && prebootstrap_events.borrow().len() == 1
-                && queued_events.borrow().len() == 1,
-            "local ExecuteCommand events should reach the terminal surface"
+            600 => events.borrow().len() == 1,
+            "a pre-bootstrap share status should use the local path after shell bootstrap"
         );
-        assert_eq!(
-            local_events.borrow().as_slice(),
-            &[("echo local".to_owned(), RecordedCommandSource::User)]
-        );
-        assert_eq!(
-            pending_events.borrow().as_slice(),
-            &[("echo setup".to_owned(), RecordedCommandSource::User)]
-        );
-        assert_eq!(
-            prebootstrap_events.borrow().as_slice(),
-            &[(
-                "echo prebootstrap pending".to_owned(),
-                RecordedCommandSource::User
-            )]
-        );
-        assert_eq!(
-            queued_events.borrow().as_slice(),
-            &[(
-                "echo queued".to_owned(),
-                RecordedCommandSource::QueuedCommand
-            )]
-        );
+        let events = events.borrow();
+        assert_eq!(events[0].0, "echo setup");
+        assert!(matches!(&events[0].1, CommandExecutionSource::User));
     });
 }
 
 #[test]
-fn active_sharer_keeps_participant_attribution_and_viewers_stay_restricted() {
+fn share_pending_queued_command_uses_queued_source() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        terminal.update(&mut app, |view, _| {
+            view.model
+                .lock()
+                .set_shared_session_status(SharedSessionStatus::SharePending);
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let events = subscribe_to_execute_command_events(&mut app, &terminal);
+
+        assert!(input.update(&mut app, |input, ctx| {
+            input.try_execute_command_with_options("echo queued", true, ctx)
+        }));
+        assert_eventually!(
+            600 => events.borrow().len() == 1,
+            "a queued setup command should reach the terminal surface"
+        );
+        let events = events.borrow();
+        assert_eq!(events[0].0, "echo queued");
+        assert!(matches!(
+            &events[0].1,
+            CommandExecutionSource::QueuedCommand
+        ));
+        assert!(events[0].1.should_preserve_input());
+    });
+}
+
+#[test]
+fn active_sharer_keeps_participant_attribution() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
 
         let active_sharer_terminal =
             add_window_with_bootstrapped_terminal(&mut app, None, None).await;
-        let viewer_terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
         let sharer_id = ParticipantId::new();
         let firebase_uid = UserUid::new("mock_firebase_uid");
         let sharer_id_for_manager = sharer_id.clone();
@@ -306,35 +308,61 @@ fn active_sharer_keeps_participant_attribution_and_viewers_stay_restricted() {
             600 => active_sharer_events.borrow().len() == 1,
             "active sharer command should reach the terminal surface"
         );
-        assert_eq!(
-            active_sharer_events.borrow().as_slice(),
-            &[(
-                "echo attributed".to_owned(),
-                RecordedCommandSource::SharedSession(sharer_id)
-            )]
-        );
+        let events = active_sharer_events.borrow();
+        assert_eq!(events[0].0, "echo attributed");
+        match &events[0].1 {
+            CommandExecutionSource::SharedSession { participant_id, .. } => {
+                assert_eq!(participant_id, &sharer_id)
+            }
+            _ => panic!("active sharer command should retain its participant source"),
+        }
+    });
+}
 
-        let viewer_input = viewer_terminal.read(&app, |view, _| view.input().clone());
-        let viewer_events = subscribe_to_execute_command_events(&mut app, &viewer_terminal);
-        viewer_terminal.update(&mut app, |view, _| {
+#[test]
+fn view_pending_viewer_cannot_execute_commands() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        terminal.update(&mut app, |view, _| {
             view.model
                 .lock()
                 .set_shared_session_status(SharedSessionStatus::ViewPending);
         });
-        assert!(!viewer_input.update(&mut app, |input, ctx| {
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let events = subscribe_to_execute_command_events(&mut app, &terminal);
+
+        assert!(!input.update(&mut app, |input, ctx| {
             input.try_execute_command("echo pending viewer", ctx)
         }));
-        viewer_terminal.update(&mut app, |view, _| {
+        assert!(
+            events.borrow().is_empty(),
+            "a view-pending session must not emit a command intent"
+        );
+    });
+}
+
+#[test]
+fn reader_viewer_cannot_execute_commands() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        terminal.update(&mut app, |view, _| {
             view.model
                 .lock()
                 .set_shared_session_status(SharedSessionStatus::reader());
         });
-        assert!(!viewer_input.update(&mut app, |input, ctx| {
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let events = subscribe_to_execute_command_events(&mut app, &terminal);
+
+        assert!(!input.update(&mut app, |input, ctx| {
             input.try_execute_command("echo reader", ctx)
         }));
         assert!(
-            viewer_events.borrow().is_empty(),
-            "view-pending and reader sessions must not emit command intents"
+            events.borrow().is_empty(),
+            "a reader session must not emit a command intent"
         );
     });
 }
