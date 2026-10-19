@@ -24,18 +24,17 @@ use warp_graphql::mutations::prewarmed_sandbox_config::{
 };
 use warp_graphql::queries::execution_config::{ExecutionRepository, SourceRepo};
 use warp_managed_secrets::{ManagedSecretValue, convert_task_secrets};
+pub use warp_server_client::base_client::PREWARMED_SANDBOX_WORKLOAD_TOKEN_HEADER;
 use warpui::r#async::FutureExt as _;
 
 use super::ServerApi;
 use super::ai::{GitCredential, into_git_credential};
 use crate::ChannelState;
 
-/// Carries the Namespace instance identity in addition to the normal bearer credential.
-pub const PREWARMED_SANDBOX_WORKLOAD_TOKEN_HEADER: &str = "X-Warp-Prewarmed-Sandbox-Workload-Token";
 /// Bounds each complete request, including credential lookup and response decoding.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Matches the server's `PrewarmedSandboxPreparation` contract for setup that does not need a task.
+/// Defines setup that does not need a task.
 #[derive(Clone)]
 pub struct PrewarmedSandboxPreparation {
     pub harness: String,
@@ -90,9 +89,9 @@ impl TryFrom<GraphqlConfiguration> for PrewarmedSandboxConfiguration {
     type Error = anyhow::Error;
 
     fn try_from(config: GraphqlConfiguration) -> Result<Self> {
-        let preparation = config.preparation;
+        let preparation = config.spec;
         Ok(Self {
-            generation: config.generation,
+            generation: config.fingerprint,
             preparation: PrewarmedSandboxPreparation {
                 harness: preparation.harness,
                 repositories: preparation.repositories,
@@ -162,7 +161,7 @@ impl PrewarmedSandboxState {
 /// Reports a preparation outcome for a specific configuration generation.
 #[derive(Debug, Serialize)]
 struct PrewarmedSandboxStatusInput {
-    generation: String,
+    fingerprint: String,
     state: &'static str,
     /// Must match the generation for a ready report.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,7 +171,7 @@ struct PrewarmedSandboxStatusInput {
 /// Confirms that a sandbox is still alive with the expected configuration generation.
 #[derive(Debug, Serialize)]
 struct PrewarmedSandboxHeartbeatInput {
-    generation: String,
+    fingerprint: String,
 }
 
 /// Endpoints a pre-warmed sandbox calls while it prepares itself and waits to be claimed.
@@ -233,15 +232,9 @@ impl ServerApi {
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl PrewarmedSandboxClient for ServerApi {
     async fn fetch_configuration(&self, sandbox_id: &str) -> Result<PrewarmedSandboxConfiguration> {
-        let workload_token = self
-            .base_client
-            .get_or_create_ambient_workload_token()
-            .await?
-            .context("A pre-warmed sandbox request requires a workload token")?;
         let operation = PrewarmedSandboxConfig::build(PrewarmedSandboxConfigVariables {
             input: PrewarmedSandboxConfigInput {
                 sandbox_id: sandbox_id.into(),
-                workload_token,
             },
             request_context: get_request_context(),
         });
@@ -268,7 +261,7 @@ impl PrewarmedSandboxClient for ServerApi {
         bounded_request(REQUEST_TIMEOUT, async {
             let url = Self::prewarmed_sandbox_url(sandbox_id, "status");
             let body = PrewarmedSandboxStatusInput {
-                generation: generation.to_string(),
+                fingerprint: generation.to_string(),
                 state: state.as_wire_value(),
                 manifest_hash: matches!(state, PrewarmedSandboxState::Ready)
                     .then(|| generation.to_string()),
@@ -291,7 +284,7 @@ impl PrewarmedSandboxClient for ServerApi {
         bounded_request(REQUEST_TIMEOUT, async {
             let url = Self::prewarmed_sandbox_url(sandbox_id, "heartbeat");
             let body = PrewarmedSandboxHeartbeatInput {
-                generation: generation.to_string(),
+                fingerprint: generation.to_string(),
             };
             let response = self
                 .prewarmed_sandbox_request(self.base_client.http_client().post(&url).json(&body))
