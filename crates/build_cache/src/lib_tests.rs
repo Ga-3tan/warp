@@ -289,6 +289,21 @@ fn is_global(command: &Command) -> bool {
         .any(|arg| Path::new(arg).ends_with("shared"))
 }
 
+fn is_mode_query(command: &Command) -> bool {
+    command_args(command)
+        .get(1)
+        .is_some_and(|arg| arg == "modes")
+}
+
+fn modes_response(modes: &[&str]) -> Vec<u8> {
+    let mut detections = modes
+        .iter()
+        .map(|mode| (mode.to_string(), serde_json::json!({"detected": true})))
+        .collect::<serde_json::Map<_, _>>();
+    detections.insert("maven".to_owned(), serde_json::json!({"detected": false}));
+    serde_json::to_vec(&serde_json::json!({ "modes": detections })).unwrap()
+}
+
 #[test]
 fn repo_cache_key_is_stable_for_canonical_identity() {
     let first = RepoCacheKey::derive(&identity(" GitHub.COM ", "WarpDev", "Warp"));
@@ -641,6 +656,10 @@ fn nested_roots_share_one_bounded_detection_pool_and_mount_serially() {
                     .copied()
                     .unwrap_or_default();
                 async move {
+                    // `cargo` is not a mode spacectl knows, so sub-projects still get dry runs.
+                    if is_mode_query(&command) {
+                        return Ok(modes_response(&["cargo"]));
+                    }
                     if is_detect(&command) {
                         detect_count.fetch_add(1, Ordering::SeqCst);
                         let active = active_detects.fetch_add(1, Ordering::SeqCst) + 1;
@@ -783,63 +802,215 @@ fn plan_keeps_only_repository_configurations_with_unclaimed_repository_paths() {
     );
 }
 
-#[test]
-fn workspace_members_and_global_only_repositories_skip_real_mounts() {
+#[derive(Default)]
+struct ToolCalls {
+    dry_runs: AtomicUsize,
+    mode_queries: AtomicUsize,
+    metadata_queries: AtomicUsize,
+    mount_cwds: Mutex<Vec<PathBuf>>,
+}
+
+struct WorkspaceLayout {
+    _temp: tempfile::TempDir,
+    cache_root: PathBuf,
+    repositories: Vec<RepositoryCacheSource>,
+    workspace_root: PathBuf,
+    tools_root: PathBuf,
+}
+
+/// A Cargo workspace with two members, a crate excluded from the workspace, and an npm project,
+/// plus a Go repository with a nested Go module.
+fn workspace_layout() -> WorkspaceLayout {
     let temp = tempfile::tempdir().unwrap();
     let workspace = source(temp.path(), "github.com", "warp", "workspace");
     let tools = source(temp.path(), "github.com", "warp", "tools");
-    fs::write(workspace.cwd.join("Cargo.toml"), "").unwrap();
-    for member in ["crates/a", "crates/b"] {
-        fs::create_dir_all(workspace.cwd.join(member)).unwrap();
-        fs::write(workspace.cwd.join(member).join("Cargo.toml"), "").unwrap();
+    for (repository, directory, marker) in [
+        (&workspace, "", "Cargo.toml"),
+        (&workspace, "crates/a", "Cargo.toml"),
+        (&workspace, "crates/b", "Cargo.toml"),
+        (&workspace, "fuzz", "Cargo.toml"),
+        (&workspace, "web", "package-lock.json"),
+        (&tools, "", "go.mod"),
+        (&tools, "sub", "go.mod"),
+    ] {
+        let directory = repository.cwd.join(directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(marker), "").unwrap();
     }
-    let workspace_root = workspace.cwd.clone();
-    let tools_root = tools.cwd.clone();
-    let detects = Arc::new(AtomicUsize::new(0));
-    let mount_cwds = Arc::new(Mutex::new(Vec::new()));
+    WorkspaceLayout {
+        cache_root: temp.path().join("cache"),
+        workspace_root: workspace.cwd.clone(),
+        tools_root: tools.cwd.clone(),
+        repositories: vec![workspace, tools],
+        _temp: temp,
+    }
+}
+
+/// Imitates spacectl and cargo for [`workspace_layout`]. Workspace members report the
+/// workspace's shared target directory, like `cargo metadata` does.
+fn run_layout_tools(
+    layout: &WorkspaceLayout,
+    modes_supported: bool,
+    calls: &ToolCalls,
+    command: Command,
+) -> Result<Vec<u8>, CacheSetupError> {
+    let cwd = command.get_current_dir().unwrap().to_path_buf();
+    let members = ["crates/a", "crates/b"].map(|member| layout.workspace_root.join(member));
+    if command.get_program() == "cargo" {
+        calls.metadata_queries.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(cwd, layout.workspace_root);
+        let packages = std::iter::once(&layout.workspace_root)
+            .chain(&members)
+            .map(|directory| serde_json::json!({"manifest_path": directory.join("Cargo.toml")}))
+            .collect::<Vec<_>>();
+        return Ok(serde_json::to_vec(&serde_json::json!({ "packages": packages })).unwrap());
+    }
+
+    let mut modes = vec!["apt"];
+    let mut mounts = vec![PathBuf::from("/var/cache/apt/archives")];
+    if cwd.join("Cargo.toml").exists() {
+        modes.push("rust");
+        mounts.push(PathBuf::from("/home/agent/.cargo/registry"));
+        mounts.push(if members.contains(&cwd) {
+            layout.workspace_root.join("target")
+        } else {
+            PathBuf::from("./target")
+        });
+    }
+    if cwd.join("go.mod").exists() {
+        modes.push("go");
+        mounts.push(PathBuf::from("/home/agent/go/pkg/mod"));
+    }
+    if cwd.join("package-lock.json").exists() {
+        modes.push("npm");
+        mounts.push(PathBuf::from("/home/agent/.npm"));
+    }
+
+    if is_mode_query(&command) {
+        calls.mode_queries.fetch_add(1, Ordering::SeqCst);
+        return if modes_supported {
+            Ok(modes_response(&modes))
+        } else {
+            Err(CacheSetupError::NonzeroExit {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "unknown command \"modes\"".to_owned(),
+            })
+        };
+    }
+    if is_detect(&command) {
+        calls.dry_runs.fetch_add(1, Ordering::SeqCst);
+        let mounts = mounts.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+        return Ok(response_with_mounts(&modes, &mounts));
+    }
+    calls.mount_cwds.lock().unwrap().push(cwd);
+    Ok(response(&modes, &[], &[]))
+}
+
+fn plan_layout(layout: &WorkspaceLayout, modes_supported: bool) -> (CacheSetupReport, ToolCalls) {
+    let calls = ToolCalls::default();
     let report = block_on(setup_cache(
-        temp.path().join("cache"),
-        vec![workspace, tools],
+        layout.cache_root.clone(),
+        layout.repositories.clone(),
         Vec::new(),
-        {
-            let detects = Arc::clone(&detects);
-            let mount_cwds = Arc::clone(&mount_cwds);
-            let workspace_root = workspace_root.clone();
-            move |command| {
-                let cwd = command.get_current_dir().unwrap().to_path_buf();
-                let registry = Path::new("/home/agent/.cargo/registry");
-                let response = if !is_detect(&command) {
-                    mount_cwds.lock().unwrap().push(cwd);
-                    response(&["rust"], &[], &[])
-                } else if cwd == tools_root {
-                    detects.fetch_add(1, Ordering::SeqCst);
-                    response_with_mounts(&["go"], &[Path::new("/home/agent/go/pkg/mod")])
-                } else if cwd == workspace_root {
-                    detects.fetch_add(1, Ordering::SeqCst);
-                    response_with_mounts(&["rust"], &[Path::new("./target"), registry])
-                } else {
-                    detects.fetch_add(1, Ordering::SeqCst);
-                    response_with_mounts(&["rust"], &[&workspace_root.join("target"), registry])
-                };
-                futures::future::ready(Ok(response))
-            }
+        |command| {
+            futures::future::ready(run_layout_tools(layout, modes_supported, &calls, command))
         },
     ));
+    (report, calls)
+}
 
-    assert_eq!(detects.load(Ordering::SeqCst), 4);
-    let plan = report.plan.unwrap();
-    let (global, repositories) = plan.configurations.split_last().unwrap();
-    assert_eq!(global.modes, ["go", "rust"]);
+/// Working directory, cache directory, and modes of a repository configuration.
+type RepositorySummary = (PathBuf, PathBuf, Vec<String>);
+
+/// Repository configurations followed by the global modes. The global working directory is a
+/// fresh scratch directory on every run.
+fn plan_summary(report: &CacheSetupReport) -> (Vec<RepositorySummary>, Vec<String>) {
+    let (global, repositories) = report
+        .plan
+        .as_ref()
+        .unwrap()
+        .configurations
+        .split_last()
+        .unwrap();
+    (
+        repositories
+            .iter()
+            .map(|configuration| {
+                (
+                    configuration.cwd.clone(),
+                    configuration.relative_cache_dir.clone(),
+                    configuration.modes.clone(),
+                )
+            })
+            .collect(),
+        global.modes.clone(),
+    )
+}
+
+#[test]
+fn workspace_members_and_global_only_repositories_skip_real_mounts() {
+    let layout = workspace_layout();
+    let (report, calls) = plan_layout(&layout, false);
+
+    assert_eq!(calls.dry_runs.load(Ordering::SeqCst), 7);
+    let (repositories, global_modes) = plan_summary(&report);
+    assert_eq!(global_modes, ["apt", "go", "npm", "rust"]);
     assert_eq!(
         repositories
             .iter()
-            .map(|configuration| configuration.cwd.clone())
+            .map(|(cwd, _, _)| cwd.clone())
             .collect::<Vec<_>>(),
-        std::slice::from_ref(&workspace_root)
+        [
+            layout.workspace_root.clone(),
+            layout.workspace_root.join("fuzz")
+        ]
     );
+    let global_cwd = report
+        .plan
+        .unwrap()
+        .configurations
+        .last()
+        .unwrap()
+        .cwd
+        .clone();
     assert_eq!(
-        *mount_cwds.lock().unwrap(),
-        [workspace_root, global.cwd.clone()]
+        *calls.mount_cwds.lock().unwrap(),
+        [
+            layout.workspace_root.clone(),
+            layout.workspace_root.join("fuzz"),
+            global_cwd
+        ]
+    );
+}
+
+#[test]
+fn mode_queries_reach_the_same_plan_with_fewer_dry_runs() {
+    let layout = workspace_layout();
+    let (dry_run_report, _) = plan_layout(&layout, false);
+    let (report, calls) = plan_layout(&layout, true);
+
+    assert_eq!(plan_summary(&report), plan_summary(&dry_run_report));
+    // Both roots plus `fuzz`, the only sub-project that might mount an unclaimed path.
+    assert_eq!(calls.dry_runs.load(Ordering::SeqCst), 3);
+    assert_eq!(calls.mode_queries.load(Ordering::SeqCst), 5);
+    assert_eq!(calls.metadata_queries.load(Ordering::SeqCst), 1);
+    let mount_cwds = calls.mount_cwds.lock().unwrap();
+    assert_eq!(
+        mount_cwds[..2],
+        [
+            layout.workspace_root.clone(),
+            layout.workspace_root.join("fuzz")
+        ]
+    );
+    assert_eq!(mount_cwds.len(), 3);
+    assert!(
+        !mount_cwds.contains(&layout.tools_root),
+        "the Go repository only has global paths"
+    );
+    assert!(
+        report.degradations().next().is_none(),
+        "mode queries are not degradations"
     );
 }
 

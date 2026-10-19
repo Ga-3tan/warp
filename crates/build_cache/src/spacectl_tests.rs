@@ -3,8 +3,11 @@ use std::path::Path;
 
 use command::r#async::Command;
 
-use super::{MountResponse, detect_command, mount_command, mount_error_diagnostic};
-use crate::CacheSetupError;
+use super::{
+    MountResponse, detect_command, modes_command, mount_command, mount_error_diagnostic,
+    run_spacectl_modes,
+};
+use crate::{CacheScope, CacheSetupError};
 
 fn args(command: &Command) -> Vec<&OsStr> {
     command.get_args().collect()
@@ -60,6 +63,50 @@ fn mount_command_has_exact_explicit_modes_dry_run_false_root_and_cwd() {
     );
     assert_eq!(command.get_current_dir(), Some(Path::new("/tmp/scratch")));
     assert_disables_toolchain_downloads(&command);
+}
+
+#[test]
+fn modes_command_has_exact_argv_and_repo_cwd() {
+    let command = modes_command(Path::new("/work/repo/sub"));
+    assert_eq!(command.get_program(), "spacectl");
+    assert_eq!(args(&command), ["cache", "modes", "-o", "json"]);
+    assert_eq!(command.get_current_dir(), Some(Path::new("/work/repo/sub")));
+    assert_disables_toolchain_downloads(&command);
+}
+
+#[test]
+fn mode_query_reports_only_detected_modes() {
+    let report = futures::executor::block_on(run_spacectl_modes(
+        CacheScope::Global,
+        "repos/key/nested/id".into(),
+        Path::new("/work/repo/sub"),
+        "id",
+        &|_| {
+            futures::future::ready(Ok(br#"{
+                "modes": {
+                    "rust": {"detected": true},
+                    "apt": {"detected": true},
+                    "go": {"detected": false},
+                    "future": {}
+                }
+            }"#
+            .to_vec()))
+        },
+    ));
+    assert!(report.succeeded());
+    assert_eq!(report.modes, ["apt", "rust"]);
+    let response = report.response.unwrap();
+    assert_eq!(response.input.modes, ["apt", "rust"]);
+    assert!(response.output.mounts.is_empty());
+
+    let failed = futures::executor::block_on(run_spacectl_modes(
+        CacheScope::Global,
+        "repos/key/nested/id".into(),
+        Path::new("/work/repo/sub"),
+        "id",
+        &|_| futures::future::ready(Ok(b"not-json".to_vec())),
+    ));
+    assert_eq!(failed.error, Some(CacheSetupError::JsonParseFailed));
 }
 
 #[test]
