@@ -131,6 +131,11 @@ sequenceDiagram
 - Server-first rollout is operationally confirmed per environment. The existing wire response cannot prove that an older server's valid `REMOTE` is correct.
 
 ## Validation criteria for implementation
+For this delivery, the requester chose isolated client and server validation and will integrate and
+test both branches locally. VM A → B handoff, real child wake → hydration → replay → message-turn
+execution, driver pagination/`--skip-initial-turn` barriers, and remaining race/failure scenarios are
+requester-owned local integration checks, not factory pre-handoff gates. The scenarios below remain
+the acceptance checklist; an unrun scenario is not a passing result. UI verification is declined.
 Add Rust cases adjacent to `app/src/pane_group/child_agent/restoration.rs`, `app/src/ai/blocklist/orchestration_event_streamer.rs`, `app/src/server/server_api/ai.rs`, and `app/src/ai/agent_sdk/driver.rs`. Run named cases from `warp` with `cargo nextest run -p warp --lib -E 'test(restored_local_child_)'`; run `cargo check -p warp` and `cargo clippy -p warp --all-targets --tests -- -D warnings`. Run server checks from `warp-server` with `go test ./router/handlers/public_api ./test/integration/ambient_agents` and the integration database configured.
 
 ### API labels and rollout
