@@ -714,12 +714,13 @@ async fn checkout(
         })?;
         let result = checkout_direct(request, &url, &target, git).await;
         if result == Err(CheckoutFailureKind::Clone) {
-            // Git can leave the empty directory we created behind after a rejected credential.
+            // Git can leave the empty directory we created behind after a failed clone.
             // A later pass must not mistake it for a successful existing checkout.
             if let Err(error) = fs::remove_dir(&target).await
                 && error.kind() != io::ErrorKind::NotFound
             {
                 git.record_error("could not remove failed clone target", error);
+                return Err(CheckoutFailureKind::RemoveTarget);
             }
         }
         result
@@ -766,7 +767,7 @@ async fn attempt_cached_checkout(
         }
         fs::remove_dir_all(target).await.map_err(|error| {
             git.record_error("could not remove failed cached checkout target", error);
-            CheckoutFailureKind::Clone
+            CheckoutFailureKind::RemoveTarget
         })?;
         Ok(CachedCheckout::Failed)
     }

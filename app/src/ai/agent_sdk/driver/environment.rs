@@ -46,7 +46,7 @@ use crate::terminal::shell::ShellType;
 
 const CODEBASE_INDEX_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const CLONE_FAILURE_OUTPUT_TRUNCATION_MARKER: &str = "\n… clone output truncated …\n";
-const CLONE_AUTH_RETRY_DELAY: Duration = Duration::from_secs(3);
+const CLONE_RETRY_DELAY: Duration = Duration::from_secs(3);
 const SETUP_COMMAND_OUTPUT_TRUNCATION_MARKER: &str = "\n… setup command output truncated …\n";
 const SETUP_COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 const SETUP_COMMAND_CWD_RESET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1284,49 +1284,7 @@ async fn execute_checkout_helper(
     })
 }
 
-fn is_clone_auth_failure(kind: CheckoutFailureKind, diagnostics: &str) -> bool {
-    match kind {
-        CheckoutFailureKind::Checkout
-        | CheckoutFailureKind::VerifyHead
-        | CheckoutFailureKind::RemoveOrigin => return false,
-        CheckoutFailureKind::Clone => {}
-    }
-    let diagnostics = diagnostics.to_ascii_lowercase();
-    let http_status = |status: &str| {
-        [
-            "returned error: ",
-            "http ",
-            "http/1.1 ",
-            "http/2 ",
-            "http status ",
-        ]
-        .iter()
-        .any(|prefix| {
-            let pattern = format!("{prefix}{status}");
-            diagnostics.match_indices(&pattern).any(|(index, _)| {
-                !diagnostics[index + pattern.len()..].starts_with(|c: char| c.is_ascii_digit())
-            })
-        })
-    };
-    if diagnostics.contains("repository") && diagnostics.contains("not found")
-        || diagnostics.contains("could not remove failed")
-        || http_status("404")
-        || http_status("403")
-    {
-        return false;
-    }
-    [
-        "authentication failed",
-        "http basic: access denied",
-        "could not read username",
-        "could not read password",
-    ]
-    .iter()
-    .any(|message| diagnostics.contains(message))
-        || http_status("401")
-}
-
-async fn checkout_with_auth_retry<Execute, Execution>(
+async fn checkout_with_clone_retry<Execute, Execution>(
     batch: &CheckoutBatch,
     mut execute: Execute,
     refresh: impl Future<Output = Result<bool, TaskGitCredentialsError>>,
@@ -1346,11 +1304,7 @@ where
     let first_report_complete = report.outcomes.len() == batch.repositories.len();
     let indexes = report
         .failures()
-        .filter(|failure| {
-            failure
-                .failure
-                .is_some_and(|kind| is_clone_auth_failure(kind, &failure.diagnostics))
-        })
+        .filter(|failure| failure.failure == Some(CheckoutFailureKind::Clone))
         .map(|failure| failure.request_index)
         .collect::<Vec<_>>();
     if indexes.is_empty() {
@@ -1370,8 +1324,8 @@ where
         .collect::<Vec<_>>()
         .join(", ");
     safe_info!(
-        safe: ("Retrying {} environment clones once: reason=authentication", indexes.len()),
-        full: ("Retrying environment clones once: repos={names} reason=authentication")
+        safe: ("Retrying {} environment clones once: reason=clone_failure", indexes.len()),
+        full: ("Retrying environment clones once: repos={names} reason=clone_failure")
     );
     let refreshed = match refresh.await {
         Ok(refreshed) => refreshed,
@@ -1393,8 +1347,8 @@ where
         .as_ref()
         .is_ok_and(|retry| retry.command_result.exit_code == 0.into());
     safe_info!(
-        safe: ("Environment clone authentication retry finished: result_ok={retry_ok}"),
-        full: ("Environment clone authentication retry finished: repos={names} result_ok={retry_ok}")
+        safe: ("Environment clone retry finished: result_ok={retry_ok}"),
+        full: ("Environment clone retry finished: repos={names} result_ok={retry_ok}")
     );
     let mut retry = retry?;
     let complete_report = retry
@@ -1438,11 +1392,6 @@ where
             };
             let reason = if !complete_report {
                 "failed without a complete checkout report"
-            } else if outcome
-                .failure
-                .is_some_and(|kind| is_clone_auth_failure(kind, &outcome.diagnostics))
-            {
-                "still failed authentication"
             } else {
                 "still failed"
             };
@@ -1473,12 +1422,12 @@ async fn clone_checkout_requests(
         command_result,
         mut report,
     } = if let Some(credential_refresh) = credential_refresh {
-        checkout_with_auth_retry(
+        checkout_with_clone_retry(
             &batch,
             |batch| async move { execute_checkout_helper(&batch, false, spawner).await },
             credential_refresh.refresh(),
             async {
-                Timer::after(CLONE_AUTH_RETRY_DELAY).await;
+                Timer::after(CLONE_RETRY_DELAY).await;
             },
         )
         .await?
