@@ -449,6 +449,7 @@ pub struct AIConversation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestoredChildHydration {
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     Unhydrated,
     Hydrating,
     Ready,
@@ -786,6 +787,7 @@ impl AIConversation {
         self.id
     }
 
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub(crate) fn new_restored_child(id: AIConversationId) -> Self {
         let mut conversation = Self::new(false, false);
         conversation.id = id;

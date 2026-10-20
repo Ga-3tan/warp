@@ -936,6 +936,7 @@ pub struct PaneGroup {
     pending_parent_child_seeds: HashMap<AmbientAgentTaskId, PendingParentChildSeed>,
 
     headless_child_owners_ready: bool,
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     restored_child_owners: HashMap<AmbientAgentTaskId, AIConversationId>,
 
     /// Test-only: counts `spawn_ancestor_list_fetch_if_needed` dispatches, so

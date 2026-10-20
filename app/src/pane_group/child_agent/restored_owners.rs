@@ -12,15 +12,18 @@ use crate::ai::blocklist::orchestration_event_streamer::agent_task_harness;
 use crate::pane_group::PaneGroup;
 use crate::terminal::TerminalView;
 
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub(crate) fn needs_restored_local_owner(task: &AmbientAgentTask) -> bool {
     task.execution_location == Some(ExecutionLocation::Local) && !task.is_third_party_harness()
 }
 
 impl PaneGroup {
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub(crate) fn release_headless_child_seed(&mut self, ctx: &mut ViewContext<Self>) {
         self.headless_child_owners_ready = true;
         self.process_pending_parent_child_seeds(ctx);
     }
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub(crate) fn prepare_restored_child_owner(
         &mut self,
         parent_conversation_id: AIConversationId,
@@ -102,6 +105,7 @@ impl PaneGroup {
         (child_id, result)
     }
 
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub(crate) fn finish_restored_child_owners(
         &mut self,
         parent_conversation_id: AIConversationId,

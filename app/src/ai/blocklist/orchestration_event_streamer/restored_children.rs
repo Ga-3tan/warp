@@ -22,6 +22,7 @@ use crate::terminal::view::load_ai_conversation::{
 };
 
 impl OrchestrationEventStreamer {
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub(crate) fn register_restored_child_owner(
         &mut self,
         conversation_id: AIConversationId,
