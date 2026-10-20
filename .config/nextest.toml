@@ -1,3 +1,8 @@
+[test-groups.windows-clipboard]
+max-threads = 1
+
+[test-groups.grok-oauth-loopback]
+max-threads = 1
 [profile.default]
 # Mark a test as slow if it takes longer than 30s to execute, and terminate it
 # if it takes 2x as long as the slow timeout (i.e.: 60s total).
@@ -9,6 +14,17 @@ filter = 'package(integration)'
 # count twice against the parallelism limit.  This improves overall runtime
 # of the test suite, despite running fewer integration tests at a time.
 threads-required = 2
+
+[[profile.default.overrides]]
+filter = 'package(warpui) and test(windowing::winit::windows::clipboard::tests::clipboard_tests::)'
+platform = { host = 'cfg(target_os = "windows")' }
+# Separate test processes still share the system clipboard.
+test-group = 'windows-clipboard'
+
+[[profile.default.overrides]]
+filter = 'package(ai) and test(grok_subscription::oauth::tests::)'
+# Process-local serial locks don't protect the shared loopback port range under nextest.
+test-group = 'grok-oauth-loopback'
 
 [profile.ci]
 # Print out output for failing tests as soon as they fail, and also at the end

@@ -294,7 +294,12 @@ fn test_searcher_async() {
                 }),
         )
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        poll_until(Duration::from_secs(10), || {
+            searcher_async.get_all_doc_ids().unwrap().len() == search_strings.len()
+        }),
+        "the background writer should finish populating the index"
+    );
 
     let result = searcher_async.get_all_doc_ids().unwrap();
     assert_eq!(
@@ -333,7 +338,19 @@ fn test_searcher_async() {
             id: 10,
         })
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        poll_until(Duration::from_secs(10), || {
+            let ids = searcher_async
+                .get_all_doc_ids()
+                .unwrap()
+                .into_iter()
+                .map(|doc| doc.id)
+                .sorted()
+                .collect_vec();
+            ids == vec![2, 3, 4, 5, 10]
+        }),
+        "the background writer should finish deleting and inserting documents"
+    );
 
     let result = searcher_async.search_id("Fix clippy formatting").unwrap();
     assert!(result.is_empty(), "the document should be deleted");
@@ -372,7 +389,16 @@ fn test_searcher_async() {
             id: 4,
         })
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        poll_until(Duration::from_secs(10), || {
+            searcher_async
+                .get_all_documents()
+                .unwrap()
+                .iter()
+                .any(|doc| doc.id == 4 && doc.name == "Updated name")
+        }),
+        "the background writer should finish updating document 4"
+    );
 
     let result = searcher_async
         .get_all_documents()
@@ -387,7 +413,12 @@ fn test_searcher_async() {
     );
 
     searcher_async.clear_search_index_async().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        poll_until(Duration::from_secs(10), || {
+            searcher_async.get_all_doc_ids().unwrap().is_empty()
+        }),
+        "the background writer should finish clearing the index"
+    );
 
     let result = searcher_async.get_all_doc_ids().unwrap();
     assert_eq!(
