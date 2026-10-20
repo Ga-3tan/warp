@@ -175,7 +175,7 @@ use crate::workspaces::user_workspaces::{ResolvedTeamScope, UserWorkspaces};
 use crate::{cmd_or_ctrl_shift, send_telemetry_from_ctx};
 
 mod ambient_pane_restoration;
-mod child_agent;
+pub(crate) mod child_agent;
 pub(crate) use child_agent::materialization::{
     ChildPaneMaterialization, decide_child_pane_materialization,
 };
@@ -934,6 +934,9 @@ pub struct PaneGroup {
     /// run id. Re-driven from the shared `TasksUpdated` subscription until
     /// every child in the server-reported list has a local conversation.
     pending_parent_child_seeds: HashMap<AmbientAgentTaskId, PendingParentChildSeed>,
+
+    headless_child_owners_ready: bool,
+    restored_child_owners: HashMap<AmbientAgentTaskId, AIConversationId>,
 
     /// Test-only: counts `spawn_ancestor_list_fetch_if_needed` dispatches, so
     /// tests can assert that a burst of `TasksUpdated` re-drives coalesces
@@ -3193,6 +3196,9 @@ impl PaneGroup {
             pending_ambient_agent_conversation_restorations: HashMap::new(),
             pending_child_hydrations: HashMap::new(),
             pending_parent_child_seeds: HashMap::new(),
+            headless_child_owners_ready: !FeatureFlag::RestoreLocalChildOwners.is_enabled()
+                || !warp_core::execution_mode::AppExecutionMode::as_ref(ctx).is_autonomous(),
+            restored_child_owners: HashMap::new(),
             #[cfg(test)]
             parent_child_seed_fetch_dispatch_count: 0,
             failed_viewer_child_sessions: HashMap::new(),

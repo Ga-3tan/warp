@@ -440,10 +440,19 @@ pub struct AIConversation {
     /// only matters for the live process that bootstrapped the conversation, and a restored
     /// conversation resumes ordinary synchronization.
     task_sync_mode: TaskSyncMode,
+    restored_child_hydration: Option<RestoredChildHydration>,
 
     /// Whether the user chose Warp-funded inference for this conversation after a ChatGPT
     /// token-sharing failure. Sticky for the rest of the conversation and inherited by forks.
     use_warp_credits_instead_of_chatgpt: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestoredChildHydration {
+    Unhydrated,
+    Hydrating,
+    Ready,
+    Error,
 }
 
 pub(crate) fn artifact_from_fork_proto(
@@ -508,6 +517,7 @@ impl AIConversation {
             pinned: false,
             remote_run_updated_at: None,
             task_sync_mode: TaskSyncMode::default(),
+            restored_child_hydration: None,
             use_warp_credits_instead_of_chatgpt: false,
         }
     }
@@ -767,12 +777,29 @@ impl AIConversation {
             pinned,
             remote_run_updated_at: None,
             task_sync_mode: TaskSyncMode::default(),
+            restored_child_hydration: None,
             use_warp_credits_instead_of_chatgpt,
         })
     }
 
     pub fn id(&self) -> AIConversationId {
         self.id
+    }
+
+    pub(crate) fn new_restored_child(id: AIConversationId) -> Self {
+        let mut conversation = Self::new(false, false);
+        conversation.id = id;
+        conversation.status = ConversationStatus::Success;
+        conversation.restored_child_hydration = Some(RestoredChildHydration::Unhydrated);
+        conversation
+    }
+
+    pub(crate) fn restored_child_hydration(&self) -> Option<RestoredChildHydration> {
+        self.restored_child_hydration
+    }
+
+    pub(crate) fn set_restored_child_hydration(&mut self, state: RestoredChildHydration) {
+        self.restored_child_hydration = Some(state);
     }
 
     /// Assigns fresh exchange IDs to all exchanges in this conversation.

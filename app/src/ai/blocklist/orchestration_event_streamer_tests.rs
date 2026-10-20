@@ -52,6 +52,270 @@ fn sse_backoff_escalates_then_caps() {
 }
 
 #[test]
+fn restored_local_child_hydration_gate() {
+    use crate::ai::agent::conversation::RestoredChildHydration;
+    use crate::test_util::terminal::{add_window_with_terminal, initialize_app_for_terminal_view};
+
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let child_id = AIConversationId::new();
+        let parent_id = AIConversationId::new();
+        let child_task_id = make_parent_task_id_for_test(0xe9);
+        let parent_task_id = make_parent_task_id_for_test(0xe8);
+        let mut child = AIConversation::new_restored_child(child_id);
+        child.set_task_id(child_task_id);
+        child.set_parent_agent_id(parent_task_id.to_string());
+        child.set_parent_conversation_id(parent_id);
+        child.set_server_conversation_token("server-token".into());
+        child.set_last_event_sequence(23);
+        BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+            history.restore_conversations(terminal.id(), vec![child], ctx);
+        });
+        let mut client = MockAIClient::new();
+        client
+            .expect_get_ai_conversation()
+            .times(1)
+            .returning(move |_| {
+                let mut metadata = make_server_metadata_with_harness(AIAgentHarness::Oz);
+                metadata.ambient_agent_task_id = Some(child_task_id);
+                Ok((
+                    api::ConversationData {
+                        tasks: vec![api::Task {
+                            id: "root".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    metadata,
+                ))
+            });
+        let server_api = ServerApiProvider::new_for_test().get();
+        let streamer = app.add_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(Arc::new(client), server_api, ctx)
+        });
+        streamer.update(&mut app, |streamer, ctx| {
+            streamer.register_restored_child_owner(child_id, &terminal, ctx);
+            assert!(streamer.streams[&child_id].wake_connection.is_some());
+            assert!(streamer.streams[&child_id].sse_connection.is_none());
+            assert!(streamer.hydrate_restored_child(child_id, ctx));
+            assert!(streamer.hydrate_restored_child(child_id, ctx));
+            assert!(streamer.streams[&child_id].wake_connection.is_none());
+            assert!(!streamer.is_eligible(child_id, ctx));
+        });
+        crate::test_util::assert_eventually!(
+            streamer.read(&app, |streamer, ctx| streamer
+                .restored_child_state(child_id, ctx)
+                == Some(RestoredChildHydration::Ready)),
+            "hydration did not install the transcript"
+        );
+        streamer.read(&app, |streamer, ctx| {
+            let history = BlocklistAIHistoryModel::as_ref(ctx);
+            let child = history.conversation(&child_id).unwrap();
+            assert_eq!(child.task_id(), Some(child_task_id));
+            assert_eq!(
+                child.parent_agent_id(),
+                Some(parent_task_id.to_string().as_str())
+            );
+            assert_eq!(child.parent_conversation_id(), Some(parent_id));
+            assert_eq!(
+                child.server_conversation_token().unwrap().as_str(),
+                "server-token"
+            );
+            assert_eq!(child.last_event_sequence(), Some(23));
+            assert_eq!(child.status(), &ConversationStatus::Success);
+            assert_eq!(
+                history.terminal_surface_id_for_conversation(&child_id),
+                Some(terminal.id())
+            );
+            assert_eq!(streamer.streams[&child_id].event_cursor, 23);
+            assert!(streamer.streams[&child_id].sse_connection.is_some());
+        });
+    });
+}
+
+#[test]
+fn restored_local_child_observer_seed_generation() {
+    use crate::ai::ambient_agents::ExecutionLocation;
+    use crate::server::server_api::ai::{AgentRunsPage, AgentRunsPageInfo};
+
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let parent = make_parent_task_id_for_test(0xe1);
+        let stale = make_parent_task_id_for_test(0xe2);
+        let current = make_parent_task_id_for_test(0xe3);
+        let mut mock = MockAIClient::new();
+        let mut sequence = mockall::Sequence::new();
+        for id in [stale, current] {
+            mock.expect_list_agent_runs_page()
+                .times(1)
+                .in_sequence(&mut sequence)
+                .returning(move |_, _| {
+                    let mut child = make_ambient_task_with_task_id(id, Some(999));
+                    child.parent_run_id = Some(parent.to_string());
+                    child.execution_location = Some(ExecutionLocation::Local);
+                    Ok(AgentRunsPage {
+                        runs: vec![child],
+                        harness_names: Vec::new(),
+                        page_info: AgentRunsPageInfo {
+                            has_next_page: false,
+                            next_cursor: None,
+                        },
+                    })
+                });
+        }
+        let server_api = ServerApiProvider::new_for_test().get();
+        let streamer = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(Arc::new(mock), server_api, ctx)
+        });
+        streamer.update(&mut app, |streamer, ctx| {
+            let consumer = warpui::EntityId::new();
+            streamer.register_viewer_mode_consumer(parent, AIConversationId::new(), consumer, ctx);
+            streamer.unregister_viewer_mode_consumer(parent, consumer);
+            streamer.register_viewer_mode_consumer(
+                parent,
+                AIConversationId::new(),
+                warpui::EntityId::new(),
+                ctx,
+            );
+            let entry = streamer.viewer_mode_orchestrators.get_mut(&parent).unwrap();
+            entry.event_cursor = 37;
+            assert!(!entry.seeded);
+            assert!(entry.sse_connection.is_none());
+        });
+        crate::test_util::assert_eventually!(
+            streamer.read(&app, |streamer, _| streamer.viewer_mode_orchestrators
+                [&parent]
+                .seeded),
+            "new Observer generation did not seed"
+        );
+        streamer.read(&app, |streamer, _| {
+            let entry = &streamer.viewer_mode_orchestrators[&parent];
+            assert_eq!(entry.known_children, HashSet::from([current.to_string()]));
+            assert_eq!(entry.event_cursor, 37);
+            assert!(entry.sse_connection.is_some());
+        });
+    });
+}
+
+#[test]
+fn restored_local_child_transcript_error() {
+    use crate::ai::agent::conversation::RestoredChildHydration;
+    for failure in ["fetch/decode", "token", "harness", "conversion"] {
+        App::test((), |mut app| async move {
+            initialize_settings_for_tests(&mut app);
+            let (sender, _receiver) = std::sync::mpsc::sync_channel::<ModelEvent>(16);
+            let mut resources = GlobalResourceHandles::mock(&mut app);
+            resources.model_event_sender = Some(sender);
+            app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(resources));
+            let history =
+                app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+            let child_id = AIConversationId::new();
+            let task_id = make_parent_task_id_for_test(0xf1);
+            let mut child = AIConversation::new_restored_child(child_id);
+            child.set_task_id(task_id);
+            child.set_parent_agent_id(make_parent_task_id_for_test(0xf0).to_string());
+            child.set_parent_conversation_id(AIConversationId::new());
+            child.set_server_conversation_token("server-token".into());
+            child.set_last_event_sequence(13);
+            history.update(&mut app, |history, ctx| {
+                history.restore_conversations(warpui::EntityId::new(), vec![child], ctx);
+            });
+            let mut client = MockAIClient::new();
+            client
+                .expect_get_ai_conversation()
+                .times(1)
+                .returning(move |_| {
+                    if failure == "fetch/decode" {
+                        return Err(anyhow::anyhow!("invalid transcript"));
+                    }
+                    let mut metadata = make_server_metadata_with_harness(AIAgentHarness::Oz);
+                    if failure == "token" {
+                        metadata.server_conversation_token =
+                            crate::ai::agent::api::ServerConversationToken::new(
+                                "wrong-token".into(),
+                            );
+                    }
+                    if failure == "harness" {
+                        metadata.harness = AIAgentHarness::ClaudeCode;
+                    }
+                    Ok((api::ConversationData::default(), metadata))
+                });
+            let reported_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            client
+                .expect_update_agent_task()
+                .times(1)
+                .withf(move |id, state, _, _, status, _, _| {
+                    *id == task_id
+                        && *state == Some(warp_graphql::ai::AgentTaskState::Error)
+                        && status.is_some()
+                })
+                .returning({
+                    let reported_error = reported_error.clone();
+                    move |_, _, _, _, _, _, _| {
+                        reported_error.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    }
+                });
+            let server_api = ServerApiProvider::new_for_test().get();
+            let streamer = app.add_singleton_model(|ctx| {
+                OrchestrationEventStreamer::new_with_clients_for_test(
+                    Arc::new(client),
+                    server_api,
+                    ctx,
+                )
+            });
+            streamer.update(&mut app, |streamer, ctx| {
+                assert!(!streamer.is_eligible(child_id, ctx));
+                assert!(streamer.hydrate_restored_child(child_id, ctx));
+                assert!(streamer.hydrate_restored_child(child_id, ctx));
+                assert!(streamer.hydrate_restored_child(child_id, ctx));
+                assert_eq!(
+                    streamer.restored_child_state(child_id, ctx),
+                    Some(RestoredChildHydration::Hydrating)
+                );
+                assert!(!streamer.is_eligible(child_id, ctx));
+            });
+            crate::test_util::assert_eventually!(
+                history.read(&app, |history, _| history
+                    .conversation(&child_id)
+                    .unwrap()
+                    .status()
+                    == &ConversationStatus::Error)
+                    && reported_error.load(std::sync::atomic::Ordering::SeqCst),
+                "hydration failure {failure} did not become Error"
+            );
+            streamer.update(&mut app, |streamer, ctx| {
+                assert!(streamer.hydrate_restored_child(child_id, ctx));
+                assert!(!streamer.is_eligible(child_id, ctx));
+                assert!(
+                    streamer
+                        .streams
+                        .get(&child_id)
+                        .unwrap()
+                        .sse_connection
+                        .is_none()
+                );
+                let child = BlocklistAIHistoryModel::as_ref(ctx)
+                    .conversation(&child_id)
+                    .unwrap();
+                assert_eq!(
+                    child.restored_child_hydration(),
+                    Some(RestoredChildHydration::Error)
+                );
+                assert_eq!(child.last_event_sequence(), Some(13));
+                assert!(
+                    child
+                        .status_error_message()
+                        .unwrap()
+                        .contains(&task_id.to_string())
+                );
+            });
+        });
+    }
+}
+
+#[test]
 fn restored_observer_registration_hydrates_local_cursor() {
     App::test((), |mut app| async move {
         let history_model =
@@ -1744,9 +2008,9 @@ fn repeated_viewer_registration_starts_one_ancestor_seed_fetch() {
         app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
 
         let mut mock = MockAIClient::new();
-        mock.expect_list_ambient_agent_tasks()
+        mock.expect_list_agent_runs_page()
             .times(1)
-            .returning(|_, _, _| Err(anyhow::anyhow!("fetch observed")));
+            .returning(|_, _| Err(anyhow::anyhow!("fetch observed")));
         let ai_client: Arc<dyn AIClient> = Arc::new(mock);
         let server_api = ServerApiProvider::new_for_test().get();
         let streamer = app.add_singleton_model(|ctx| {
@@ -2319,8 +2583,8 @@ fn finish_ancestor_seed_fetch_emits_child_spawned_for_each_seeded_child() {
                 .expect("viewer-mode entry exists after seed");
             assert!(entry.seeded, "seeded flag must flip after seed apply");
             assert_eq!(
-                entry.event_cursor, 11,
-                "event_cursor must advance to max(child.last_event_sequence)"
+                entry.event_cursor, 0,
+                "listing must not advance the locally processed Observer cursor"
             );
         });
     });

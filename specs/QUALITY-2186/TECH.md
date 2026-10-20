@@ -5,12 +5,12 @@
 The new VM can show the parent's children, but it cannot receive messages for native (Oz) children that ran locally in the old VM.
 Restore each child's **owner** in the new parent process before the parent can send it a message.
 Subscribe to the child's events immediately; load its full conversation only on its first message or pane open.
-This PR is a specification, not a runtime change.
+Implementation and validation follow this contract.
 
 ## Handoff contract
-1. VM A is destroyed **before** VM B restores the parent. If both VMs can own a child at once, stop and redesign ownership before implementation.
+1. Child restoration inherits the parent's existing handoff and workload-credential safeguards. Do not require an additional physical-VM-destruction barrier or introduce child-specific fencing; predecessor teardown may still be in progress.
 2. VM B restores the parent's conversation and environment. It discovers **all direct children** through one complete, paginated server traversal.
-3. VM B creates one lightweight owner for each native/Oz child classified `LOCAL`. The parent may resume only after those owners can listen for their own messages. Remote and non-Oz children do not get new owners here.
+3. VM B creates one lightweight owner for each native/Oz child classified `LOCAL`. The parent may resume only after each eligible child is listening or explicitly in `Error`. Owner-setup failure affects that child, not the parent's ability to recover. Remote and non-Oz children do not get new owners here.
 4. When the parent sends to a local child, that child's event wakes its owner. The owner loads the existing transcript, then replays and delivers the message. Failed hydration puts that child in `Error` without executing a turn.
 5. Desktop viewers and the Observer show passive child representations. Viewing a cloud parent's child never makes the desktop the child's owner.
 
@@ -64,6 +64,7 @@ The diagram shows a shared **algorithm**, not one shared cache or process. The t
 - Reuse each child's existing run ID, server conversation token, parent conversation ID, title, harness, and the parent's restored working directory. A missing usable token enters the child Error path; never create a replacement server run or transcript.
 - `TerminalDriver::create` already opens a root workspace with a `PaneGroup`. Retain that group's handle for `AgentDriver`; find the parent pane by terminal-view ID. In the group's `ViewContext`, create a metadata-only **owner** conversation indexed by the child's existing run ID and bound to its existing token. Restore it through `PaneGroup::create_hidden_child_agent_pane`. The child gets a separate controller, terminal surface, and own-run event consumer. A hidden shell in the same workspace is allowed; another VM or workspace is not.
 - Keep a run-ID-to-owner map and reconcile it with the history model's run-ID index. Repeated seeds, SSE reconnects, and restoration must not create a second owner, pane, or consumer. If a passive placeholder raced ahead of the owner, replace or promote it without losing the run-ID mapping. A placeholder must not suppress owner creation.
+- If an individual pane, controller, or shell cannot be initialized, mark that child `Error` locally and on the server, leave its execution gate closed, and allow the parent to continue and recover. Never silently skip an eligible child.
 
 ### 4. Keep desktop and Observer consumers passive
 **Desktop `PaneGroup`:**
@@ -113,7 +114,7 @@ sequenceDiagram
 - If fetch, decode, conversion, or installation fails, stop the child's wake listener and leave normal delivery blocked. Set **both** local conversation and server task to `Error` with child run ID and failed stage. Use `AIClient::update_agent_task`/status reporting or the smallest explicit equivalent if normal sync requires a turn. Do not execute a request, confirm delivery, or automatically retry the failed child. Surface an Error-reporting failure rather than claiming success. A later deliberate restoration can retry only by creating a new owner from durable state. Other children stay active.
 
 ## Boundaries and trade-offs
-- **One owner, one VM:** VM A must be gone before VM B revives a child. The child uses the parent's restored files; do not add cross-VM generation fencing, child snapshots, or a second workspace. A contrary production trace blocks deployment pending a new safety review.
+- **Parent-equivalent safety:** Reuse the parent's existing handoff and inherited-workload-credential safeguards. Physical VM teardown need not finish before restoration. The child uses the parent's restored files; do not add a new destruction barrier, child-specific fencing, child snapshots, or a second workspace.
 - **Narrow message scope:** Only a *running parent* sending to its *direct native/Oz local child* is covered. No messages sent while the parent VM is absent, child-to-parent or external-to-child delivery, undelivered-inbox scan, periodic poll, or `read_at` change. The `read_at` timing fix is separate.
 - **Metadata now, transcript later:** Eager full history would simplify the first message but slow handoff as histories grow. Metadata-only owners subscribe before the parent resumes and fetch only on wake/open.
 - **Correct the field, not a new one:** A new ownership field would keep the old response's accidental live-execution meaning but increase contract and client rollout work. Correcting `execution_location` aligns response and filters; decouple session-link eligibility to avoid a stale join link.
@@ -130,7 +131,7 @@ sequenceDiagram
 - Server-first rollout is operationally confirmed per environment. The existing wire response cannot prove that an older server's valid `REMOTE` is correct.
 
 ## Validation criteria for implementation
-These are implementation checks, **not** runtime tests run by this spec-only PR. Add Rust cases adjacent to `app/src/pane_group/child_agent/restoration.rs`, `app/src/ai/blocklist/orchestration_event_streamer.rs`, `app/src/server/server_api/ai.rs`, and `app/src/ai/agent_sdk/driver.rs`. Run named cases from `warp` with `cargo nextest run -p warp --lib -E 'test(restored_local_child_)'`; run `cargo check -p warp` and `cargo clippy -p warp --all-targets --tests -- -D warnings`. Run server checks from `warp-server` with `go test ./router/handlers/public_api ./test/integration/ambient_agents` and the integration database configured.
+Add Rust cases adjacent to `app/src/pane_group/child_agent/restoration.rs`, `app/src/ai/blocklist/orchestration_event_streamer.rs`, `app/src/server/server_api/ai.rs`, and `app/src/ai/agent_sdk/driver.rs`. Run named cases from `warp` with `cargo nextest run -p warp --lib -E 'test(restored_local_child_)'`; run `cargo check -p warp` and `cargo clippy -p warp --all-targets --tests -- -D warnings`. Run server checks from `warp-server` with `go test ./router/handlers/public_api ./test/integration/ambient_agents` and the integration database configured.
 
 ### API labels and rollout
 - Extend `TestConvertTasksToItems_ExecutionLocation` (`warp-server/router/handlers/public_api/agent_webhooks_test.go:1945-2010`). An ended `worker_id=local` run with no active execution and `source=ORCHESTRATION` returns `LOCAL`; nonlocal and unset/NULL workers return `REMOTE`.
@@ -143,7 +144,7 @@ These are implementation checks, **not** runtime tests run by this spec-only PR.
 - Reject malformed rows, missing locations, wrong parents, conflicting duplicate parent/location/harness, and missing, empty, or repeated next cursors.
 
 ### VM A → B
-- `restored_local_child_vm_a_to_b` destroys A, restores the parent and child in B, then sends parent-to-child mail. Assert A termination precedes B owner creation; an observed overlap blocks deployment.
+- `restored_local_child_vm_a_to_b` restores the parent and child in B, then sends parent-to-child mail. Preserve the existing parent handoff and inherited-credential fencing checks; physical teardown of A may still be in progress.
 - The run ID, server conversation token, parent link, working directory, and B-local conversation ID survive hydration. Assert one owner and own-run SSE before send, zero early transcript fetches, and one message turn.
 
 ### Headless and desktop ownership
@@ -164,6 +165,7 @@ These are implementation checks, **not** runtime tests run by this spec-only PR.
 ### Child wake, races, and failure
 - `restored_local_child_hydration_gate` delays transcript load while two SSE wakes and a pane open arrive. Assert one load, no cursor/delivery advance or child request before hydration, then one replay and one turn. Re-seed and reconnect without duplicates.
 - `restored_local_child_transcript_error` fails fetch, decode, and conversion separately. Assert local and server Error, no child request or delivery confirmation, and other children still owned. A failed Error update must be visible.
+- Owner-setup failure marks only that child Error, leaves its execution gate closed, and allows the parent to recover after complete discovery.
 
 ## Implementation map
 - Headless bootstrap and owner lifecycle: [`app/src/ai/agent_sdk/driver.rs:1102-1410`](https://github.com/warpdotdev/warp/blob/1e1acb4d74b3f55155860a785152bd23a2f3d83b/app/src/ai/agent_sdk/driver.rs#L1102-L1410), [`app/src/ai/agent_sdk/driver.rs:3441-3590`](https://github.com/warpdotdev/warp/blob/1e1acb4d74b3f55155860a785152bd23a2f3d83b/app/src/ai/agent_sdk/driver.rs#L3441-L3590), [`app/src/ai/agent_sdk/driver/terminal.rs:214-265`](https://github.com/warpdotdev/warp/blob/1e1acb4d74b3f55155860a785152bd23a2f3d83b/app/src/ai/agent_sdk/driver/terminal.rs#L214-L265), [`app/src/pane_group/mod.rs:2216-2229`](https://github.com/warpdotdev/warp/blob/1e1acb4d74b3f55155860a785152bd23a2f3d83b/app/src/pane_group/mod.rs#L2216-L2229).

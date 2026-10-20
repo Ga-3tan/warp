@@ -125,6 +125,105 @@ fn initialize_app(app: &mut App) {
     initialize_app_with_history(app, Vec::new());
 }
 
+#[test]
+fn restored_local_child_placeholder_promotion_is_idempotent() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let panes = mock_pane_group(&mut app, Default::default());
+        panes.update(&mut app, |panes, ctx| {
+            let parent_pane = panes.focused_pane_id(ctx);
+            let parent_terminal = panes.terminal_view_from_pane_id(parent_pane, ctx).unwrap();
+            let parent_id = start_parent_conversation(panes, parent_pane, ctx);
+            let parent_task = new_ambient_agent_task_id();
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
+                history
+                    .conversation_mut(&parent_id)
+                    .unwrap()
+                    .set_task_id(parent_task);
+            });
+            let mut task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            task.conversation_id = Some("existing-child-token".into());
+            task.last_event_sequence = Some(19);
+            let placeholder =
+                restore_remote_child_conversation(panes, parent_pane, parent_id, task.task_id, ctx);
+            let (owner_id, owner) = panes.prepare_restored_child_owner(
+                parent_id,
+                parent_terminal.id(),
+                &task,
+                HashMap::new(),
+                ctx,
+            );
+            let terminal = owner.unwrap().unwrap();
+            assert_eq!(owner_id, placeholder);
+            assert_ne!(terminal.id(), parent_terminal.id());
+            let pane_count = panes.pane_ids().count();
+            let (again_id, again) = panes.prepare_restored_child_owner(
+                parent_id,
+                parent_terminal.id(),
+                &task,
+                HashMap::new(),
+                ctx,
+            );
+            assert_eq!(again_id, owner_id);
+            assert!(again.unwrap().is_none());
+            assert_eq!(panes.pane_ids().count(), pane_count);
+            let history = BlocklistAIHistoryModel::as_ref(ctx);
+            let owner = history.conversation(&owner_id).unwrap();
+            assert!(!owner.is_remote_child());
+            assert_eq!(owner.task_id(), Some(task.task_id));
+            assert_eq!(owner.parent_conversation_id(), Some(parent_id));
+            assert_eq!(
+                owner.server_conversation_token().unwrap().as_str(),
+                "existing-child-token"
+            );
+            assert_eq!(owner.last_event_sequence(), Some(19));
+            assert_eq!(
+                history.terminal_surface_id_for_conversation(&owner_id),
+                Some(terminal.id())
+            );
+            assert_eq!(history.child_conversation_ids_of(&parent_id), &[owner_id]);
+        });
+    });
+}
+
+#[test]
+fn restored_local_child_owner_setup_error_is_not_retried() {
+    use crate::ai::agent::conversation::RestoredChildHydration;
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let panes = mock_pane_group(&mut app, Default::default());
+        panes.update(&mut app, |panes, ctx| {
+            let parent_pane = panes.focused_pane_id(ctx);
+            let terminal = panes.terminal_view_from_pane_id(parent_pane, ctx).unwrap();
+            let parent_id = start_parent_conversation(panes, parent_pane, ctx);
+            let mut task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            let (child_id, result) = panes.prepare_restored_child_owner(
+                parent_id,
+                terminal.id(),
+                &task,
+                HashMap::new(),
+                ctx,
+            );
+            assert!(result.is_err());
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
+                let child = history.conversation_mut(&child_id).unwrap();
+                assert_eq!(child.task_id(), Some(task.task_id));
+                child.set_restored_child_hydration(RestoredChildHydration::Error);
+            });
+            task.conversation_id = Some("later-token".into());
+            let (_, result) = panes.prepare_restored_child_owner(
+                parent_id,
+                terminal.id(),
+                &task,
+                HashMap::new(),
+                ctx,
+            );
+            assert!(result.unwrap().is_none());
+            assert!(!panes.child_agent_panes.contains_key(&child_id));
+        });
+    });
+}
+
 fn initialize_app_with_history(app: &mut App, conversations: Vec<AgentConversation>) {
     initialize_settings_for_tests(app);
 

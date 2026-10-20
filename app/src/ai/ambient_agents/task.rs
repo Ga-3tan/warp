@@ -150,7 +150,7 @@ impl AgentSource {
     }
 }
 
-/// Where the server executed an agent run.
+/// Persisted run-worker classification, independent of execution liveness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ExecutionLocation {

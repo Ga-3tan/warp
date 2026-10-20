@@ -780,6 +780,9 @@ pub enum FeatureFlag {
     ///   block snapshot from the server.
     OzHandoff,
 
+    /// Requires persisted worker classification on the server before enabling local-child owners.
+    RestoreLocalChildOwners,
+
     /// Enables the upgraded CLI agent session tracking and notifications infrastructure.
     HOANotifications,
 

@@ -114,6 +114,7 @@ pub(crate) mod harness;
 mod harness_output_monitor;
 pub(crate) mod mcp_startup;
 pub(super) mod output;
+mod restored_children;
 mod snapshot;
 pub(crate) mod terminal;
 mod termination;
@@ -2202,6 +2203,7 @@ impl AgentDriver {
                 )
                 .await?;
 
+                Self::restore_local_child_owners(&foreground).await?;
                 let status_rx = foreground
                     .spawn(move |me, ctx| me.execute_run(task.prompt, ctx))
                     .await?;

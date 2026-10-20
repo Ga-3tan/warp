@@ -48,7 +48,9 @@ use super::queued_query::{QueuedQueryEvent, QueuedQueryId, QueuedQueryModel};
 use super::{BlocklistAIInputModel, ResponseStreamId};
 use crate::ai::AIRequestUsageModel;
 use crate::ai::agent::api::{self, ServerConversationToken};
-use crate::ai::agent::conversation::{AIConversation, AIConversationId, ConversationStatus};
+use crate::ai::agent::conversation::{
+    AIConversation, AIConversationId, ConversationStatus, RestoredChildHydration,
+};
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
     AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
@@ -2236,7 +2238,9 @@ impl BlocklistAIController {
         let is_ready_status = matches!(
             conversation.status(),
             ConversationStatus::Success | ConversationStatus::WaitingForEvents,
-        );
+        ) && conversation
+            .restored_child_hydration()
+            .is_none_or(|state| state == RestoredChildHydration::Ready);
         // Injection is a native MAA request against the conversation's root task. When another
         // driver authors the turns (e.g. an ACP harness whose client-side mapper owns the task
         // tree), the server has no task to attach the events to and fails the run instead;
@@ -3007,6 +3011,13 @@ impl BlocklistAIController {
             };
 
             let active_tasks = conversation.compute_active_tasks();
+
+            anyhow::ensure!(
+                conversation
+                    .restored_child_hydration()
+                    .is_none_or(|state| state == RestoredChildHydration::Ready),
+                "Restored child transcript is not ready"
+            );
 
             (
                 conversation.id(),

@@ -467,6 +467,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::AgentHarness,
         #[cfg(feature = "oz_handoff")]
         FeatureFlag::OzHandoff,
+        #[cfg(feature = "restore_local_child_owners")]
+        FeatureFlag::RestoreLocalChildOwners,
         #[cfg(feature = "handoff_local_cloud")]
         FeatureFlag::HandoffLocalCloud,
         #[cfg(feature = "hoa_notifications")]
