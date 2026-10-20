@@ -53,6 +53,7 @@ fn clone_auth_classifier_recognizes_rejections_without_retrying_other_failures()
         "fatal: couldn't find remote ref missing",
         "fatal: Could not resolve host: gitlab.com",
         "fatal: Failed to connect to gitlab.com port 443",
+        "Authentication failed\ncould not remove failed clone target: permission denied",
         "fatal: unable to access https://gitlab.com/team/repo-401.git",
     ] {
         assert!(

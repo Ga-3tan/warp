@@ -1309,6 +1309,7 @@ fn is_clone_auth_failure(kind: CheckoutFailureKind, diagnostics: &str) -> bool {
         })
     };
     if diagnostics.contains("repository") && diagnostics.contains("not found")
+        || diagnostics.contains("could not remove failed clone target")
         || http_status("404")
         || http_status("403")
     {
