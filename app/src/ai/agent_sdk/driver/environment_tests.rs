@@ -14,7 +14,7 @@ use warp_core::command::ExitCode;
 
 use super::super::environment_checkout_protocol::{
     CheckoutBatch, CheckoutFailureKind, CheckoutOutcome, CheckoutReport, CheckoutRequest,
-    ResolvedHeads, is_valid_git_object_id,
+    CloneFailureCredentialIdentity, ResolvedHeads, is_valid_git_object_id,
 };
 use super::{
     CheckoutHelperResult, CloneFailureIdentityDiagnostics, ExecutedCommand,
@@ -219,6 +219,54 @@ fn clone_auth_retry_stops_after_second_rejection_and_preserves_identity() {
         "second: clone was retried once after a credential refresh and still failed authentication"
     ));
     assert!(message.contains("Author: Fixture"));
+}
+
+#[test]
+fn clone_auth_retry_retains_identity_for_other_failed_forges() {
+    let mut batch = checkout_batch(["forbidden", "rejected"]);
+    batch.repositories[1].source.code_forge = RepositoryForge::GitLab;
+    let github = CloneFailureCredentialIdentity {
+        host: "github.com".to_owned(),
+        username: Some("github-user".to_owned()),
+    };
+    let gitlab = CloneFailureCredentialIdentity {
+        host: "gitlab.com".to_owned(),
+        username: Some("gitlab-user".to_owned()),
+    };
+    let mut first = checkout_result(vec![
+        checkout_outcome(0, Some(CheckoutFailureKind::Clone), "HTTP 403"),
+        checkout_outcome(1, Some(CheckoutFailureKind::Clone), "Authentication failed"),
+    ]);
+    first.report.as_mut().unwrap().identity_diagnostics = Some(CloneFailureIdentityDiagnostics {
+        author: Some("Fixture".to_owned()),
+        credentials: vec![github.clone(), gitlab.clone()],
+    });
+    let mut retry = checkout_result(vec![checkout_outcome(
+        0,
+        Some(CheckoutFailureKind::Clone),
+        "Authentication failed",
+    )]);
+    retry.report.as_mut().unwrap().identity_diagnostics = Some(CloneFailureIdentityDiagnostics {
+        author: None,
+        credentials: vec![CloneFailureCredentialIdentity {
+            host: "gitlab.com".to_owned(),
+            username: None,
+        }],
+    });
+    let mut results = [first, retry].into_iter();
+
+    let result = block_on(checkout_with_auth_retry(
+        &batch,
+        |_| ready(Ok(results.next().unwrap())),
+        ready(Ok(true)),
+        ready(()),
+    ))
+    .unwrap();
+
+    let identity = result.report.unwrap().identity_diagnostics.unwrap();
+    assert_eq!(identity.author.as_deref(), Some("Fixture"));
+    assert!(identity.credentials.contains(&github));
+    assert!(identity.credentials.contains(&gitlab));
 }
 
 #[test]

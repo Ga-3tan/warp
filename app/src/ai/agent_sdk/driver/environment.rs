@@ -1309,7 +1309,7 @@ fn is_clone_auth_failure(kind: CheckoutFailureKind, diagnostics: &str) -> bool {
         })
     };
     if diagnostics.contains("repository") && diagnostics.contains("not found")
-        || diagnostics.contains("could not remove failed clone target")
+        || diagnostics.contains("could not remove failed")
         || http_status("404")
         || http_status("403")
     {
@@ -1402,7 +1402,23 @@ where
         .as_ref()
         .is_some_and(|report| report.outcomes.len() == indexes.len());
     if complete_report && let Some(retry_report) = &mut retry.report {
-        if let Some(identity) = retry_report.identity_diagnostics.take() {
+        if let Some(mut identity) = retry_report.identity_diagnostics.take() {
+            if let Some(previous) = report.identity_diagnostics.take() {
+                identity.author = identity.author.or(previous.author);
+                for credential in previous.credentials {
+                    if let Some(updated) = identity
+                        .credentials
+                        .iter_mut()
+                        .find(|updated| updated.host == credential.host)
+                    {
+                        if updated.username.is_none() {
+                            updated.username = credential.username;
+                        }
+                    } else {
+                        identity.credentials.push(credential);
+                    }
+                }
+            }
             report.identity_diagnostics = Some(identity);
         }
         report
