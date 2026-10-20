@@ -187,6 +187,11 @@ pub(crate) async fn prepare_workspace(
         harness_working_dir = foreground
             .spawn(move |me, ctx| {
                 let working_dir = me.working_dir.clone();
+                let credential_refresh = environment::CloneCredentialRefresh {
+                    task_id: me.task_id.map(|id| id.to_string()),
+                    ai_client: ServerApiProvider::as_ref(ctx).get_ai_client().clone(),
+                    use_factory_repositories: me.use_factory_repositories,
+                };
                 me.terminal_driver.update(ctx, |_, ctx| {
                     environment::prepare_environment(
                         working_dir,
@@ -195,6 +200,7 @@ pub(crate) async fn prepare_workspace(
                         workspace,
                         setup_events,
                         snapshot_reporter,
+                        credential_refresh,
                         ctx,
                     )
                 })

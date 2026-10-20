@@ -1772,6 +1772,25 @@ fn lazy_pins_verify_sha_origin_policy_and_never_fall_back() {
 struct Fixture {
     root: PathBuf,
 }
+#[test]
+fn failed_direct_clone_leaves_a_retryable_target() {
+    fixture_test("failed_direct_clone_leaves_a_retryable_target", |fixture| {
+        let unavailable = fixture.root.join("unavailable.git");
+        fs::rename(fixture.origin(), &unavailable).unwrap();
+        let batch = fixture.batch(vec![fixture.request("retry", None)]);
+        let outcomes = checkout_batch(&batch, None).unwrap();
+        assert_eq!(outcomes[0].failure, Some(CheckoutFailureKind::Clone));
+        assert!(!fixture.work().join("retry").exists());
+
+        fs::rename(&unavailable, fixture.origin()).unwrap();
+        let outcomes = checkout_batch(&batch, None).unwrap();
+        assert_succeeded(&outcomes);
+        assert_eq!(
+            git(&fixture.work().join("retry"), &["rev-parse", "HEAD"]),
+            fixture.base()
+        );
+    });
+}
 
 impl Fixture {
     fn origin(&self) -> PathBuf {

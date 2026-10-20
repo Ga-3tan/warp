@@ -13,19 +13,300 @@ use warp_cli::agent::{
 use warp_core::command::ExitCode;
 
 use super::super::environment_checkout_protocol::{
-    CheckoutBatch, CheckoutRequest, ResolvedHeads, is_valid_git_object_id,
+    CheckoutBatch, CheckoutFailureKind, CheckoutOutcome, CheckoutReport, CheckoutRequest,
+    ResolvedHeads, is_valid_git_object_id,
 };
 use super::{
-    CloneFailureIdentityDiagnostics, PrepareEnvironmentError, RepositoryCloneRequest,
-    ResolvedRepository, SETUP_COMMAND_OUTPUT_TRUNCATION_MARKER, SetupCommandPhase,
-    WorkspaceConfiguration, await_setup_phase, build_checkout_helper_command, environment_snapshot,
-    merge_repos_deduped, parse_resolved_head_sha, read_checkout_report, reported_resolved_heads,
+    CheckoutHelperResult, CloneFailureIdentityDiagnostics, ExecutedCommand,
+    PrepareEnvironmentError, RepositoryCloneRequest, ResolvedRepository,
+    SETUP_COMMAND_OUTPUT_TRUNCATION_MARKER, SetupCommandPhase, WorkspaceConfiguration,
+    await_setup_phase, build_checkout_helper_command, checkout_failure_error,
+    checkout_with_auth_retry, environment_snapshot, is_clone_auth_failure, merge_repos_deduped,
+    parse_resolved_head_sha, read_checkout_report, reported_resolved_heads,
     repository_clone_requests, setup_command_failure, single_repo_name,
     validate_repository_preparation_overrides,
 };
 use crate::ai::agent_sdk::driver::AgentDriverError;
 use crate::ai::cloud_environments::{AmbientAgentEnvironment, SourceRepo};
+use crate::server::server_api::ai::TaskGitCredentialsError;
 use crate::terminal::shell::ShellType;
+#[test]
+fn clone_auth_classifier_recognizes_rejections_without_retrying_other_failures() {
+    for diagnostics in [
+        "fatal: Authentication failed for 'https://gitlab.com/team/repo.git/'",
+        "remote: HTTP Basic: Access denied",
+        "fatal: could not read Username for 'https://gitlab.com': terminal prompts disabled",
+        "fatal: could not read Password for 'https://user@gitlab.com': terminal prompts disabled",
+        "fatal: unable to access remote: The requested URL returned error: 401",
+        "HTTP/2 401 Unauthorized",
+    ] {
+        assert!(
+            is_clone_auth_failure(CheckoutFailureKind::Clone, diagnostics),
+            "{diagnostics}"
+        );
+    }
+    for diagnostics in [
+        "remote: repository not found",
+        "fatal: repository 'https://gitlab.com/team/missing.git' not found",
+        "HTTP 404 Not Found\nAuthentication failed",
+        "HTTP/1.1 403 Forbidden\nAuthentication failed",
+        "fatal: couldn't find remote ref missing",
+        "fatal: Could not resolve host: gitlab.com",
+        "fatal: Failed to connect to gitlab.com port 443",
+        "fatal: unable to access https://gitlab.com/team/repo-401.git",
+    ] {
+        assert!(
+            !is_clone_auth_failure(CheckoutFailureKind::Clone, diagnostics),
+            "{diagnostics}"
+        );
+    }
+    for kind in [
+        CheckoutFailureKind::Checkout,
+        CheckoutFailureKind::VerifyHead,
+        CheckoutFailureKind::RemoveOrigin,
+    ] {
+        assert!(!is_clone_auth_failure(kind, "Authentication failed"));
+    }
+}
+
+fn checkout_outcome(
+    index: usize,
+    failure: Option<CheckoutFailureKind>,
+    diagnostics: &str,
+) -> CheckoutOutcome {
+    CheckoutOutcome {
+        request_index: index,
+        failure,
+        diagnostics: diagnostics.to_owned(),
+        duration_ms: 0,
+        resolved_head: failure
+            .is_none()
+            .then(|| "0123456789abcdef0123456789abcdef01234567".to_owned()),
+    }
+}
+
+fn checkout_result(outcomes: Vec<CheckoutOutcome>) -> CheckoutHelperResult {
+    CheckoutHelperResult {
+        command_result: ExecutedCommand {
+            exit_code: i32::from(outcomes.iter().any(|outcome| outcome.failure.is_some())).into(),
+            block_id: super::BlockId::new(),
+        },
+        report: Some(CheckoutReport {
+            outcomes,
+            ..Default::default()
+        }),
+    }
+}
+
+#[test]
+fn clone_auth_retry_preserves_successful_checkouts_and_all_resolved_heads() {
+    let batch = checkout_batch(["ready", "rejected"]);
+    let mut passes = Vec::new();
+    let mut successful = checkout_outcome(0, None, "");
+    successful.resolved_head = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned());
+    let mut results = [
+        checkout_result(vec![
+            successful,
+            checkout_outcome(1, Some(CheckoutFailureKind::Clone), "Authentication failed"),
+        ]),
+        checkout_result(vec![checkout_outcome(0, None, "")]),
+    ]
+    .into_iter();
+    let mut refreshes = 0;
+    let mut delays = 0;
+
+    let result = block_on(checkout_with_auth_retry(
+        &batch,
+        |batch| {
+            passes.push(batch.repositories);
+            ready(Ok(results.next().unwrap()))
+        },
+        async {
+            refreshes += 1;
+            Ok(true)
+        },
+        async {
+            delays += 1;
+        },
+    ))
+    .unwrap();
+
+    assert_eq!(refreshes, 1);
+    assert_eq!(delays, 1);
+    assert_eq!(
+        passes,
+        vec![
+            batch.repositories.clone(),
+            vec![batch.repositories[1].clone()]
+        ]
+    );
+    assert_eq!(result.command_result.exit_code, 0.into());
+    let heads = reported_resolved_heads(&result.report.unwrap(), &batch);
+    assert_eq!(
+        heads,
+        ResolvedHeads::from([
+            (
+                "ready".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
+            ),
+            (
+                "rejected".to_owned(),
+                "0123456789abcdef0123456789abcdef01234567".to_owned()
+            ),
+        ])
+    );
+}
+
+#[test]
+fn clone_auth_retry_stops_after_second_rejection_and_preserves_identity() {
+    let batch = checkout_batch(["first", "second"]);
+    let mut attempts = 0;
+    let mut refreshes = 0;
+    let result = block_on(checkout_with_auth_retry(
+        &batch,
+        |batch| {
+            attempts += 1;
+            let mut result = checkout_result(
+                batch
+                    .repositories
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| {
+                        checkout_outcome(
+                            index,
+                            Some(CheckoutFailureKind::Clone),
+                            "HTTP Basic: Access denied",
+                        )
+                    })
+                    .collect(),
+            );
+            result.report.as_mut().unwrap().identity_diagnostics =
+                Some(CloneFailureIdentityDiagnostics {
+                    author: Some("Fixture".to_owned()),
+                    credentials: Vec::new(),
+                });
+            ready(Ok(result))
+        },
+        async {
+            refreshes += 1;
+            Ok(true)
+        },
+        ready(()),
+    ))
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(refreshes, 1);
+    assert_ne!(result.command_result.exit_code, 0.into());
+    let repos = repository_clone_requests(
+        &[
+            repo(CodeForge::GitHub, "warpdotdev", "first"),
+            repo(CodeForge::GitHub, "warpdotdev", "second"),
+        ],
+        &[],
+        false,
+    )
+    .unwrap();
+    let error = checkout_failure_error(&repos, result.report, None);
+    assert!(
+        matches!(&error, PrepareEnvironmentError::CloneRepo { repo_name, .. } if repo_name == "warpdotdev/first, warpdotdev/second")
+    );
+    let message = error.to_string();
+    assert!(message.contains(
+        "first: clone was retried once after a credential refresh and still failed authentication"
+    ));
+    assert!(message.contains(
+        "second: clone was retried once after a credential refresh and still failed authentication"
+    ));
+    assert!(message.contains("Author: Fixture"));
+}
+
+#[test]
+fn clone_auth_retry_does_not_refresh_or_delay_a_non_auth_failure() {
+    let batch = checkout_batch(["forbidden"]);
+    let mut attempts = 0;
+    let result = block_on(checkout_with_auth_retry(
+        &batch,
+        |_| {
+            attempts += 1;
+            ready(Ok(checkout_result(vec![checkout_outcome(
+                0,
+                Some(CheckoutFailureKind::Clone),
+                "HTTP 403",
+            )])))
+        },
+        async { panic!("non-auth failures must not refresh") },
+        async { panic!("non-auth failures must not delay") },
+    ))
+    .unwrap();
+    assert_eq!(attempts, 1);
+    assert_ne!(result.command_result.exit_code, 0.into());
+}
+
+#[test]
+fn clone_auth_retry_continues_after_refresh_failure_without_clearing_other_errors() {
+    let batch = checkout_batch(["forbidden", "rejected"]);
+    let mut results = [
+        checkout_result(vec![
+            checkout_outcome(0, Some(CheckoutFailureKind::Clone), "HTTP 403"),
+            checkout_outcome(1, Some(CheckoutFailureKind::Clone), "Authentication failed"),
+        ]),
+        checkout_result(vec![checkout_outcome(0, None, "")]),
+    ]
+    .into_iter();
+    let result = block_on(checkout_with_auth_retry(
+        &batch,
+        |_| ready(Ok(results.next().unwrap())),
+        ready(Err(TaskGitCredentialsError::Request(anyhow::anyhow!(
+            "refresh unavailable"
+        )))),
+        ready(()),
+    ))
+    .unwrap();
+    assert_ne!(result.command_result.exit_code, 0.into());
+    let report = result.report.unwrap();
+    assert_eq!(
+        report
+            .failures()
+            .map(|failure| failure.request_index)
+            .collect::<Vec<_>>(),
+        [0]
+    );
+    assert!(reported_resolved_heads(&report, &batch).contains_key("rejected"));
+}
+
+#[test]
+fn clone_auth_retry_does_not_accept_a_missing_retry_report() {
+    let batch = checkout_batch(["rejected"]);
+    let mut retry = checkout_result(Vec::new());
+    retry.report = None;
+    let mut results = [
+        checkout_result(vec![checkout_outcome(
+            0,
+            Some(CheckoutFailureKind::Clone),
+            "Authentication failed",
+        )]),
+        retry,
+    ]
+    .into_iter();
+    let result = block_on(checkout_with_auth_retry(
+        &batch,
+        |_| ready(Ok(results.next().unwrap())),
+        ready(Ok(false)),
+        ready(()),
+    ))
+    .unwrap();
+    assert_ne!(result.command_result.exit_code, 0.into());
+    assert!(
+        result
+            .report
+            .unwrap()
+            .failures()
+            .next()
+            .unwrap()
+            .diagnostics
+            .contains("failed without a complete checkout report")
+    );
+}
 
 #[test]
 fn resolved_repositories_apply_origin_policy_per_checkout() {

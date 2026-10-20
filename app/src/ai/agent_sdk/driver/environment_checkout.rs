@@ -711,7 +711,13 @@ async fn checkout(
             git.record_error("could not create checkout target", error);
             CheckoutFailureKind::Clone
         })?;
-        checkout_direct(request, &url, &target, git).await
+        let result = checkout_direct(request, &url, &target, git).await;
+        if result == Err(CheckoutFailureKind::Clone) {
+            // Git can leave the empty directory we created behind after a rejected credential.
+            // A later pass must not mistake it for a successful existing checkout.
+            let _ = fs::remove_dir(&target).await;
+        }
+        result
     }
     .await;
     tracing::Span::current().record("existing", existing_field);

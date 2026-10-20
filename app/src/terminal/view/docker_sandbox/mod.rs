@@ -23,7 +23,7 @@ use super::TerminalView;
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::agent_sdk::driver::{
     WARP_DRIVE_SYNC_TIMEOUT,
-    environment::{WorkspaceConfiguration, prepare_environment},
+    environment::{CloneCredentialRefresh, WorkspaceConfiguration, prepare_environment},
     terminal::TerminalDriver,
 };
 #[cfg(not(target_family = "wasm"))]
@@ -251,6 +251,11 @@ impl TerminalView {
         let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client().clone();
         let background = ctx.background_executor();
         let setup_events = SetupClientEventReporter::noop(ai_client.clone(), background.clone());
+        let credential_refresh = CloneCredentialRefresh {
+            task_id: None,
+            ai_client: ai_client.clone(),
+            use_factory_repositories: false,
+        };
         let environment_snapshot_reporter =
             EnvironmentSnapshotReporter::noop(ai_client, background.clone());
 
@@ -316,6 +321,7 @@ impl TerminalView {
                             workspace,
                             setup_events,
                             environment_snapshot_reporter,
+                            credential_refresh,
                             ctx,
                         )
                     })

@@ -38,6 +38,7 @@ use crate::ai::agent_sdk::environment_snapshot::{
 };
 use crate::ai::agent_sdk::setup_observability::{SetupClientEventReporter, SetupStep};
 use crate::ai::cloud_environments::{AmbientAgentEnvironment, SourceRepo};
+use crate::server::server_api::ai::{AIClient, TaskGitCredentialsError};
 use crate::server::telemetry::secret_redaction::redact_secrets_in_string;
 use crate::terminal::model::BlockId;
 use crate::terminal::model::session::command_executor::shell_escape_single_quotes;
@@ -45,6 +46,7 @@ use crate::terminal::shell::ShellType;
 
 const CODEBASE_INDEX_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const CLONE_FAILURE_OUTPUT_TRUNCATION_MARKER: &str = "\n… clone output truncated …\n";
+const CLONE_AUTH_RETRY_DELAY: Duration = Duration::from_secs(3);
 const SETUP_COMMAND_OUTPUT_TRUNCATION_MARKER: &str = "\n… setup command output truncated …\n";
 const SETUP_COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 const SETUP_COMMAND_CWD_RESET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -414,6 +416,26 @@ pub(crate) fn validate_repository_preparation_overrides(
     Ok(())
 }
 
+pub(crate) struct CloneCredentialRefresh {
+    pub task_id: Option<String>,
+    pub ai_client: Arc<dyn AIClient>,
+    pub use_factory_repositories: bool,
+}
+
+impl CloneCredentialRefresh {
+    async fn refresh(&self) -> Result<bool, TaskGitCredentialsError> {
+        let Some(task_id) = &self.task_id else {
+            return Ok(false);
+        };
+        if !warp_isolation_platform::workload_token_available() {
+            return Ok(false);
+        }
+        git_credentials::try_refresh(task_id, &self.ai_client, self.use_factory_repositories)
+            .await?;
+        Ok(true)
+    }
+}
+
 /// Prepare a cloud agent environment within a terminal session. This will:
 /// 1. Materialize all repositories, enforcing server-provided HEAD overrides.
 /// 2. Begin codebase indexing for all repositories (Oz harness only).
@@ -428,6 +450,7 @@ pub(crate) fn validate_repository_preparation_overrides(
 /// caller rather than a path-prefix inference, so non-sandbox callers that
 /// happen to pass a path like `/home/agent/...` don't silently flip into
 /// sandbox-only mode.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_environment(
     working_dir: PathBuf,
     is_sandbox: bool,
@@ -435,6 +458,7 @@ pub(crate) fn prepare_environment(
     workspace: WorkspaceConfiguration,
     setup_events: SetupClientEventReporter,
     environment_snapshot_reporter: EnvironmentSnapshotReporter,
+    credential_refresh: CloneCredentialRefresh,
     ctx: &mut ModelContext<TerminalDriver>,
 ) -> impl Future<Output = Result<PathBuf, PrepareEnvironmentError>> + use<> {
     let spawner = ctx.spawner();
@@ -470,6 +494,7 @@ pub(crate) fn prepare_environment(
             Arc::clone(&repo_channels),
             setup_events,
             environment_snapshot_reporter,
+            credential_refresh,
         )
         .await;
 
@@ -599,6 +624,7 @@ async fn prepare_environment_impl(
     repo_channels: Arc<Mutex<HashMap<PathBuf, oneshot::Sender<()>>>>,
     setup_events: SetupClientEventReporter,
     environment_snapshot_reporter: EnvironmentSnapshotReporter,
+    credential_refresh: CloneCredentialRefresh,
 ) -> Result<PathBuf, PrepareEnvironmentError> {
     let working_dir_string = working_dir.to_string_lossy().to_string();
 
@@ -626,7 +652,13 @@ async fn prepare_environment_impl(
     } else {
         setup_events
             .record_result(SetupStep::EnvironmentRepoClone, async {
-                clone_checkout_requests(&repository_clone_requests, working_dir, spawner).await
+                clone_checkout_requests(
+                    &repository_clone_requests,
+                    working_dir,
+                    spawner,
+                    Some(&credential_refresh),
+                )
+                .await
             })
             .await?
     };
@@ -1035,6 +1067,7 @@ pub(super) async fn clone_repos(
         &repository_clone_requests(repos, &[], false)?,
         working_dir,
         spawner,
+        None,
     )
     .await
     .map(|_| ())
@@ -1251,11 +1284,169 @@ async fn execute_checkout_helper(
     })
 }
 
+fn is_clone_auth_failure(kind: CheckoutFailureKind, diagnostics: &str) -> bool {
+    match kind {
+        CheckoutFailureKind::Checkout
+        | CheckoutFailureKind::VerifyHead
+        | CheckoutFailureKind::RemoveOrigin => return false,
+        CheckoutFailureKind::Clone => {}
+    }
+    let diagnostics = diagnostics.to_ascii_lowercase();
+    let http_status = |status: &str| {
+        [
+            "returned error: ",
+            "http ",
+            "http/1.1 ",
+            "http/2 ",
+            "http status ",
+        ]
+        .iter()
+        .any(|prefix| {
+            let pattern = format!("{prefix}{status}");
+            diagnostics.match_indices(&pattern).any(|(index, _)| {
+                !diagnostics[index + pattern.len()..].starts_with(|c: char| c.is_ascii_digit())
+            })
+        })
+    };
+    if diagnostics.contains("repository") && diagnostics.contains("not found")
+        || http_status("404")
+        || http_status("403")
+    {
+        return false;
+    }
+    [
+        "authentication failed",
+        "http basic: access denied",
+        "could not read username",
+        "could not read password",
+    ]
+    .iter()
+    .any(|message| diagnostics.contains(message))
+        || http_status("401")
+}
+
+async fn checkout_with_auth_retry<Execute, Execution>(
+    batch: &CheckoutBatch,
+    mut execute: Execute,
+    refresh: impl Future<Output = Result<bool, TaskGitCredentialsError>>,
+    delay: impl Future<Output = ()>,
+) -> Result<CheckoutHelperResult, PrepareEnvironmentError>
+where
+    Execute: FnMut(CheckoutBatch) -> Execution,
+    Execution: Future<Output = Result<CheckoutHelperResult, PrepareEnvironmentError>>,
+{
+    let mut result = execute(batch.clone()).await?;
+    if result.command_result.exit_code == 0.into() {
+        return Ok(result);
+    }
+    let Some(report) = &mut result.report else {
+        return Ok(result);
+    };
+    let first_report_complete = report.outcomes.len() == batch.repositories.len();
+    let indexes = report
+        .failures()
+        .filter(|failure| {
+            failure
+                .failure
+                .is_some_and(|kind| is_clone_auth_failure(kind, &failure.diagnostics))
+        })
+        .map(|failure| failure.request_index)
+        .collect::<Vec<_>>();
+    if indexes.is_empty() {
+        return Ok(result);
+    }
+    let retry_batch = CheckoutBatch {
+        working_dir: batch.working_dir.clone(),
+        repositories: indexes
+            .iter()
+            .map(|&index| batch.repositories[index].clone())
+            .collect(),
+    };
+    let names = retry_batch
+        .repositories
+        .iter()
+        .map(|request| request.checkout_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    safe_info!(
+        safe: ("Retrying {} environment clones once: reason=authentication", indexes.len()),
+        full: ("Retrying environment clones once: repos={names} reason=authentication")
+    );
+    let refreshed = match refresh.await {
+        Ok(refreshed) => refreshed,
+        Err(error) => {
+            let class = match error {
+                TaskGitCredentialsError::Platform { .. } => "platform",
+                TaskGitCredentialsError::Request(_) => "request",
+                TaskGitCredentialsError::Unstructured { .. } => "unstructured",
+            };
+            log::warn!(
+                "Environment clone credential refresh failed: class={class}; retrying with existing credentials"
+            );
+            false
+        }
+    };
+    delay.await;
+    let retry = execute(retry_batch).await;
+    let retry_ok = retry
+        .as_ref()
+        .is_ok_and(|retry| retry.command_result.exit_code == 0.into());
+    safe_info!(
+        safe: ("Environment clone authentication retry finished: result_ok={retry_ok}"),
+        full: ("Environment clone authentication retry finished: repos={names} result_ok={retry_ok}")
+    );
+    let mut retry = retry?;
+    let complete_report = retry
+        .report
+        .as_ref()
+        .is_some_and(|report| report.outcomes.len() == indexes.len());
+    if complete_report && let Some(retry_report) = &mut retry.report {
+        if let Some(identity) = retry_report.identity_diagnostics.take() {
+            report.identity_diagnostics = Some(identity);
+        }
+        report
+            .outcomes
+            .retain(|outcome| !indexes.contains(&outcome.request_index));
+        for mut outcome in retry_report.outcomes.drain(..) {
+            outcome.request_index = indexes[outcome.request_index];
+            report.outcomes.push(outcome);
+        }
+    }
+    for outcome in &mut report.outcomes {
+        if indexes.contains(&outcome.request_index) && outcome.failure.is_some() {
+            let refresh_status = if refreshed {
+                "after a credential refresh"
+            } else {
+                "after a credential refresh was attempted or unavailable"
+            };
+            let reason = if !complete_report {
+                "failed without a complete checkout report"
+            } else if outcome
+                .failure
+                .is_some_and(|kind| is_clone_auth_failure(kind, &outcome.diagnostics))
+            {
+                "still failed authentication"
+            } else {
+                "still failed"
+            };
+            outcome.diagnostics = format!(
+                "{}\n{}: clone was retried once {refresh_status} and {reason}.",
+                outcome.diagnostics, batch.repositories[outcome.request_index].checkout_name
+            );
+        }
+    }
+    if retry_ok && complete_report && first_report_complete && report.failures().next().is_none() {
+        result.command_result.exit_code = 0.into();
+    }
+    Ok(result)
+}
+
 #[tracing::instrument(skip_all, err, fields(tags.cloud_agent = true))]
 async fn clone_checkout_requests(
     repos: &[RepositoryCloneRequest],
     working_dir: &Path,
     spawner: &ModelSpawner<TerminalDriver>,
+    credential_refresh: Option<&CloneCredentialRefresh>,
 ) -> Result<EnvironmentSnapshot, PrepareEnvironmentError> {
     if repos.is_empty() {
         return Ok(EnvironmentSnapshot::empty());
@@ -1264,7 +1455,46 @@ async fn clone_checkout_requests(
     let CheckoutHelperResult {
         command_result,
         mut report,
-    } = execute_checkout_helper(&batch, false, spawner).await?;
+    } = if let Some(credential_refresh) = credential_refresh {
+        checkout_with_auth_retry(
+            &batch,
+            |batch| async move { execute_checkout_helper(&batch, false, spawner).await },
+            credential_refresh.refresh(),
+            async {
+                Timer::after(CLONE_AUTH_RETRY_DELAY).await;
+            },
+        )
+        .await?
+    } else {
+        execute_checkout_helper(&batch, false, spawner).await?
+    };
+    if command_result.exit_code != 0.into() {
+        let fallback_output = if report
+            .as_ref()
+            .is_some_and(|report| report.failures().next().is_some())
+        {
+            None
+        } else {
+            fetch_clone_failure_output(&command_result.block_id, spawner).await
+        };
+        return Err(checkout_failure_error(
+            repos,
+            report.take(),
+            fallback_output,
+        ));
+    }
+    let resolved_heads = report
+        .as_ref()
+        .map(|report| reported_resolved_heads(report, &batch))
+        .unwrap_or_default();
+    Ok(environment_snapshot(repos, working_dir, &resolved_heads))
+}
+
+fn checkout_failure_error(
+    repos: &[RepositoryCloneRequest],
+    mut report: Option<CheckoutReport>,
+    fallback_output: Option<String>,
+) -> PrepareEnvironmentError {
     let identity_diagnostics = report
         .as_mut()
         .and_then(|report| report.identity_diagnostics.take())
@@ -1273,57 +1503,50 @@ async fn clone_checkout_requests(
         .as_ref()
         .map(|report| report.failures().collect::<Vec<_>>())
         .filter(|failures| !failures.is_empty());
-    if command_result.exit_code != 0.into() {
-        let failed_requests = match &failures {
-            Some(failures) => failures
-                .iter()
-                .map(|failure| &repos[failure.request_index])
-                .collect(),
-            None => repos.iter().collect::<Vec<_>>(),
-        };
-        let repo_name = failed_requests
+    let failed_requests = match &failures {
+        Some(failures) => failures
             .iter()
-            .map(|request| request.remote.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if let Some(failures) = &failures
-            && failures
-                .iter()
-                .all(|failure| failure.failure == Some(CheckoutFailureKind::Checkout))
-        {
-            return Err(PrepareEnvironmentError::CheckoutFailed {
-                repo_name,
-                checkout_ref: failed_requests
-                    .iter()
-                    .filter_map(|request| request.checkout.as_ref())
-                    .map(RepositoryHeadRef::value)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                identity_diagnostics,
-            });
-        }
-        let output = match failures {
-            Some(failures) => Some(failure_output::prepare_failure_output(
-                &failures
-                    .iter()
-                    .map(|failure| failure.diagnostics.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                CLONE_FAILURE_OUTPUT_TRUNCATION_MARKER,
-            )),
-            None => fetch_clone_failure_output(&command_result.block_id, spawner).await,
-        };
-        return Err(PrepareEnvironmentError::CloneRepo {
+            .map(|failure| &repos[failure.request_index])
+            .collect(),
+        None => repos.iter().collect::<Vec<_>>(),
+    };
+    let repo_name = failed_requests
+        .iter()
+        .map(|request| request.remote.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(failures) = &failures
+        && failures
+            .iter()
+            .all(|failure| failure.failure == Some(CheckoutFailureKind::Checkout))
+    {
+        return PrepareEnvironmentError::CheckoutFailed {
             repo_name,
-            output,
+            checkout_ref: failed_requests
+                .iter()
+                .filter_map(|request| request.checkout.as_ref())
+                .map(RepositoryHeadRef::value)
+                .collect::<Vec<_>>()
+                .join(", "),
             identity_diagnostics,
-        });
+        };
     }
-    let resolved_heads = report
-        .as_ref()
-        .map(|report| reported_resolved_heads(report, &batch))
-        .unwrap_or_default();
-    Ok(environment_snapshot(repos, working_dir, &resolved_heads))
+    let output = match failures {
+        Some(failures) => Some(failure_output::prepare_failure_output(
+            &failures
+                .iter()
+                .map(|failure| failure.diagnostics.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            CLONE_FAILURE_OUTPUT_TRUNCATION_MARKER,
+        )),
+        None => fallback_output,
+    };
+    PrepareEnvironmentError::CloneRepo {
+        repo_name,
+        output,
+        identity_diagnostics,
+    }
 }
 
 /// Register a cloned source repository with `DetectedRepositories` so that the
