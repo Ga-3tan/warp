@@ -4,8 +4,8 @@ use std::path::Path;
 use command::r#async::Command;
 
 use super::{
-    MountResponse, detect_command, modes_command, mount_command, mount_error_diagnostic,
-    run_spacectl_modes,
+    MountResponse, detect_command, failed_planning_mode, modes_command, mount_command,
+    mount_error_diagnostic, run_spacectl_modes,
 };
 use crate::{CacheScope, CacheSetupError};
 
@@ -146,6 +146,59 @@ fn mount_response_deserializes_spacectl_output() {
 
     let response = serde_json::from_slice::<MountResponse>(br#"{"input":{},"output":{}}"#).unwrap();
     assert_eq!(response.output.disk_usage, None);
+}
+
+fn nonzero_exit(stdout: &str, stderr: &str) -> CacheSetupError {
+    CacheSetupError::NonzeroExit {
+        exit_code: Some(1),
+        stdout: stdout.to_owned(),
+        stderr: stderr.to_owned(),
+    }
+}
+
+#[test]
+fn failed_planning_mode_reads_spacectl_json_and_log_errors() {
+    let modes = [
+        "apt".to_owned(),
+        "go".to_owned(),
+        "golangci-lint".to_owned(),
+    ];
+    assert_eq!(
+        failed_planning_mode(
+            &nonzero_exit(
+                r#"{"error": true, "message": "planning golangci-lint: golangci-lint cache status: exit status 3"}"#,
+                "",
+            ),
+            &modes,
+        ),
+        Some("golangci-lint".to_owned())
+    );
+    assert_eq!(
+        failed_planning_mode(
+            &nonzero_exit("", "ERROR planning go: go env: exit status 1"),
+            &modes
+        ),
+        Some("go".to_owned())
+    );
+}
+
+#[test]
+fn failed_planning_mode_ignores_unattributable_errors() {
+    let modes = ["apt".to_owned(), "go".to_owned()];
+    for error in [
+        nonzero_exit(
+            r#"{"error": true, "message": "mounting mode path \"/root/go\": permission denied"}"#,
+            "",
+        ),
+        nonzero_exit(
+            r#"{"error": true, "message": "planning npm: npm missing"}"#,
+            "",
+        ),
+        nonzero_exit("planning go", ""),
+        CacheSetupError::Timeout,
+    ] {
+        assert_eq!(failed_planning_mode(&error, &modes), None, "{error}");
+    }
 }
 
 #[test]

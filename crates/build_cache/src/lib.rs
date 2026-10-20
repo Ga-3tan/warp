@@ -46,7 +46,10 @@ mod sub_projects;
 use discovery::produce_candidates;
 use discovery::{CacheCandidate, CandidateKey, DETECTION_CONCURRENCY, candidate_receiver};
 use metadata::{CacheMetadataError, CacheUsage, lexically_normalized, normalized_cache_root};
-use spacectl::{Mount, MountContext, MountResponse, run_spacectl_modes, run_spacectl_mount};
+use spacectl::{
+    Mount, MountContext, MountResponse, failed_planning_mode, run_spacectl_modes,
+    run_spacectl_mount,
+};
 use sub_projects::{CargoWorkspace, needs_dry_run};
 
 const SPACECTL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -748,57 +751,62 @@ where
     let mut global_env = None;
     for configuration in &plan.configurations {
         let configuration_root = plan.cache_root.join(&configuration.relative_cache_dir);
-        let invocation = if create_cache_dir_all(&configuration_root, run_command.as_ref())
+        let invocations = if create_cache_dir_all(&configuration_root, run_command.as_ref())
             .await
             .is_err()
         {
-            failed_invocation(
+            vec![failed_invocation(
                 configuration.scope.clone(),
                 configuration.modes.clone(),
                 configuration.relative_cache_dir.clone(),
                 CacheSetupError::RootCreationFailed,
                 Duration::ZERO,
-            )
+            )]
         } else {
             safe_info!(
                 safe: ("Mounting cache modes {:?} for scope kind '{}'", configuration.modes, configuration.scope.kind()),
                 full: ("Mounting cache modes {:?} for {:?}", configuration.modes, configuration.scope)
             );
-            run_spacectl_mount(
-                configuration.scope.clone(),
-                configuration.modes.clone(),
-                false,
-                MountContext {
-                    relative_cache_dir: configuration.relative_cache_dir.clone(),
-                    cache_root: configuration_root,
-                    cwd: configuration.cwd.clone(),
-                    stable_child_id: String::new(),
-                },
-                run_command.as_ref(),
-            )
-            .await
-        };
-
-        if let Some(response) = &invocation.response {
-            report.mounted_paths.extend(response.output.mounts.clone());
-            tracing::info!(cache_result = ?response.output, modes = ?response.input.modes, scope = ?configuration.scope, "Mounted cache paths");
-
             match &configuration.scope {
-                CacheScope::Repository { .. } => {
-                    for (name, value) in &response.output.add_envs {
-                        if repository_env.insert(name.clone(), value.clone()).is_some() {
-                            log::warn!(
-                                "repository build-cache environment conflict resolved by canonical repository order"
-                            );
-                        }
-                    }
-                }
+                CacheScope::Repository { .. } => vec![
+                    mount_modes(
+                        configuration,
+                        &configuration_root,
+                        configuration.modes.clone(),
+                        run_command.as_ref(),
+                    )
+                    .await,
+                ],
                 CacheScope::Global => {
-                    global_env = Some(response.output.add_envs.clone());
+                    mount_global(configuration, &configuration_root, run_command.as_ref()).await
                 }
             }
+        };
+
+        for invocation in invocations {
+            if let Some(response) = &invocation.response {
+                report.mounted_paths.extend(response.output.mounts.clone());
+                tracing::info!(cache_result = ?response.output, modes = ?response.input.modes, scope = ?configuration.scope, "Mounted cache paths");
+
+                match &configuration.scope {
+                    CacheScope::Repository { .. } => {
+                        for (name, value) in &response.output.add_envs {
+                            if repository_env.insert(name.clone(), value.clone()).is_some() {
+                                log::warn!(
+                                    "repository build-cache environment conflict resolved by canonical repository order"
+                                );
+                            }
+                        }
+                    }
+                    // Successful global invocations are in canonical mode order, so later modes
+                    // win conflicts.
+                    CacheScope::Global => global_env
+                        .get_or_insert_with(BTreeMap::new)
+                        .extend(response.output.add_envs.clone()),
+                }
+            }
+            report.invocations.push(invocation);
         }
-        report.invocations.push(invocation);
     }
 
     // The global response covers all detected modes; repository values are only a fallback.
@@ -816,6 +824,92 @@ where
     });
     report.plan = Some(plan);
     report
+}
+
+async fn mount_modes<F, Fut>(
+    configuration: &CacheConfiguration,
+    configuration_root: &Path,
+    modes: Vec<String>,
+    run_command: &F,
+) -> CachePreparationReport
+where
+    F: Fn(Command) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, CacheSetupError>>,
+{
+    run_spacectl_mount(
+        configuration.scope.clone(),
+        modes,
+        false,
+        MountContext {
+            relative_cache_dir: configuration.relative_cache_dir.clone(),
+            cache_root: configuration_root.to_owned(),
+            cwd: configuration.cwd.clone(),
+            stable_child_id: String::new(),
+        },
+        run_command,
+    )
+    .await
+}
+
+/// Mounts the global configuration so that one failing mode cannot prevent caching for the
+/// others. When spacectl names the mode whose planning failed, that mode is dropped and the rest
+/// are retried. Otherwise, each remaining mode is mounted in its own invocation.
+///
+/// spacectl derives each mount's cache location from its destination alone, so splitting modes
+/// across invocations keeps the on-volume layout. The one exception is `swiftpm`, which also
+/// mounts Xcode's module cache when `xcode` is not part of the same invocation.
+///
+/// Every invocation either succeeds, drops a mode, or ends the retries, so this makes at most
+/// twice as many invocations as there are modes. Each dropped or failed mode is reported in its
+/// own failed invocation, and successful invocations are returned in canonical mode order.
+async fn mount_global<F, Fut>(
+    configuration: &CacheConfiguration,
+    configuration_root: &Path,
+    run_command: &F,
+) -> Vec<CachePreparationReport>
+where
+    F: Fn(Command) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, CacheSetupError>>,
+{
+    let mut modes = configuration.modes.clone();
+    let mut invocations = Vec::new();
+    while !modes.is_empty() {
+        let invocation = mount_modes(
+            configuration,
+            configuration_root,
+            modes.clone(),
+            run_command,
+        )
+        .await;
+        let Some(error) = invocation.error.clone() else {
+            invocations.push(invocation);
+            break;
+        };
+        if let Some(mode) = failed_planning_mode(&error, &modes) {
+            tracing::warn!(mode, "Retrying global cache mount without failing mode");
+            modes.retain(|candidate| *candidate != mode);
+            invocations.push(failed_invocation(
+                CacheScope::Global,
+                vec![mode],
+                configuration.relative_cache_dir.clone(),
+                error,
+                invocation.duration,
+            ));
+            continue;
+        }
+        if modes.len() == 1 {
+            invocations.push(invocation);
+            break;
+        }
+        tracing::warn!("Mounting global cache modes individually after unattributed failure");
+        for mode in modes {
+            invocations.push(
+                mount_modes(configuration, configuration_root, vec![mode], run_command).await,
+            );
+        }
+        break;
+    }
+    invocations
 }
 
 /// Detects the cache modes for `candidate`. Repository roots always get a full dry run so their

@@ -68,6 +68,12 @@ pub struct DiskUsage {
     pub used: String,
 }
 
+/// Error printed to stdout by `spacectl -o json` when a command fails.
+#[derive(Deserialize)]
+struct ErrorResponse {
+    message: String,
+}
+
 #[derive(Deserialize)]
 struct ModesResponse {
     #[serde(default)]
@@ -305,6 +311,27 @@ where
             failed_invocation(scope, Vec::new(), relative_cache_dir, err, duration)
         }
     }
+}
+
+/// Identifies which of `modes` failed to plan, from spacectl's `planning <mode>: ...` error.
+pub(super) fn failed_planning_mode(error: &CacheSetupError, modes: &[String]) -> Option<String> {
+    let CacheSetupError::NonzeroExit { stdout, stderr, .. } = error else {
+        return None;
+    };
+    let message = serde_json::from_str::<ErrorResponse>(stdout)
+        .map(|response| response.message)
+        .unwrap_or_default();
+    [message.as_str(), stdout, stderr]
+        .into_iter()
+        .find_map(|output| {
+            output
+                .match_indices("planning ")
+                .find_map(|(index, prefix)| {
+                    let (mode, _) = output[index + prefix.len()..].split_once(':')?;
+                    modes.iter().find(|candidate| *candidate == mode)
+                })
+        })
+        .cloned()
 }
 
 fn record_error(span: &tracing::Span, error: &CacheSetupError) {

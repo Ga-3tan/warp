@@ -1014,6 +1014,182 @@ fn mode_queries_reach_the_same_plan_with_fewer_dry_runs() {
     );
 }
 
+fn requested_modes(command: &Command) -> Vec<String> {
+    command_args(command)
+        .iter()
+        .find_map(|arg| arg.to_str()?.strip_prefix("--mode="))
+        .map(|modes| modes.split(',').map(ToOwned::to_owned).collect())
+        .unwrap_or_default()
+}
+
+fn spacectl_error(message: &str) -> CacheSetupError {
+    CacheSetupError::NonzeroExit {
+        exit_code: Some(1),
+        stdout: serde_json::json!({"error": true, "message": message}).to_string(),
+        stderr: String::new(),
+    }
+}
+
+/// Runs setup with only global modes. `mount` receives the modes of each real mount and returns
+/// an error message, or `None` to succeed. Successful mounts report one mount and `<MODE>_HOME` per
+/// mode, plus a `SHARED` variable naming the mode.
+fn mount_global_modes(
+    modes: &[&str],
+    mount: impl Fn(&[String]) -> Option<String>,
+) -> (CacheSetupReport, Vec<Vec<String>>) {
+    let temp = tempfile::tempdir().unwrap();
+    let cache_root = temp.path().join("cache");
+    let calls = Mutex::new(Vec::new());
+    let report = block_on(setup_cache(
+        cache_root.clone(),
+        Vec::new(),
+        modes.iter().map(ToString::to_string).collect(),
+        |command| {
+            let modes = requested_modes(&command);
+            calls.lock().unwrap().push(modes.clone());
+            let result = match mount(&modes) {
+                Some(message) => Err(spacectl_error(&message)),
+                None => Ok(serde_json::to_vec(&serde_json::json!({
+                    "input": {"modes": modes},
+                    "output": {
+                        "add_envs": modes
+                            .iter()
+                            .map(|mode| (format!("{}_HOME", mode.to_uppercase()), serde_json::json!("set")))
+                            .chain([("SHARED".to_owned(), serde_json::json!(modes.last().unwrap()))])
+                            .collect::<serde_json::Map<_, _>>(),
+                        "mounts": modes
+                            .iter()
+                            .map(|mode| serde_json::json!({
+                                "mode": mode,
+                                "cache_path": cache_root.join("shared").join(mode),
+                                "mount_path": format!("/home/agent/{mode}"),
+                                "cache_hit": false,
+                            }))
+                            .collect::<Vec<_>>(),
+                    },
+                }))
+                .unwrap()),
+            };
+            futures::future::ready(result)
+        },
+    ));
+    (report, calls.into_inner().unwrap())
+}
+
+fn mounted_modes(report: &CacheSetupReport) -> Vec<String> {
+    report
+        .mounted_paths
+        .iter()
+        .map(|mount| mount.mode.clone())
+        .collect()
+}
+
+fn degraded_modes(report: &CacheSetupReport) -> Vec<Vec<String>> {
+    report
+        .degradations()
+        .map(|invocation| {
+            assert!(matches!(invocation.scope, CacheScope::Global));
+            invocation.modes.clone()
+        })
+        .collect()
+}
+
+#[test]
+fn global_mount_retries_without_mode_that_failed_planning() {
+    let (report, calls) = mount_global_modes(&["apt", "go", "golangci-lint", "npm"], |modes| {
+        if modes.iter().any(|mode| mode == "golangci-lint") {
+            Some("planning golangci-lint: golangci-lint cache status: exit status 3".to_owned())
+        } else if modes.iter().any(|mode| mode == "go") {
+            Some("planning go: go env: exit status 1".to_owned())
+        } else {
+            None
+        }
+    });
+
+    assert_eq!(
+        calls,
+        [
+            vec!["apt", "go", "golangci-lint", "npm"],
+            vec!["apt", "go", "npm"],
+            vec!["apt", "npm"],
+        ]
+    );
+    assert_eq!(degraded_modes(&report), [["golangci-lint"], ["go"]]);
+    assert_eq!(mounted_modes(&report), ["apt", "npm"]);
+    assert_eq!(
+        report.add_envs.keys().collect::<Vec<_>>(),
+        ["APT_HOME", "NPM_HOME", "SHARED"]
+    );
+}
+
+#[test]
+fn unattributed_global_failure_mounts_each_mode_separately() {
+    let (report, calls) = mount_global_modes(&["apt", "go", "npm"], |modes| match modes {
+        [mode] if mode == "go" => Some("mounting mode path \"/root/go\": busy".to_owned()),
+        [_] => None,
+        _ => Some("mounting mode path \"/root/go\": busy".to_owned()),
+    });
+
+    assert_eq!(
+        calls,
+        [
+            vec!["apt", "go", "npm"],
+            vec!["apt"],
+            vec!["go"],
+            vec!["npm"]
+        ]
+    );
+    assert_eq!(degraded_modes(&report), [["go"]]);
+    assert_eq!(mounted_modes(&report), ["apt", "npm"]);
+    let usage = report
+        .cache_usage(&report.plan.as_ref().unwrap().cache_root)
+        .unwrap();
+    assert_eq!(
+        usage
+            .iter()
+            .map(|usage| usage.path.clone())
+            .collect::<Vec<_>>(),
+        [PathBuf::from("shared/apt"), PathBuf::from("shared/npm")]
+    );
+}
+
+#[test]
+fn per_mode_global_environment_merges_in_canonical_mode_order() {
+    let (report, _) = mount_global_modes(&["npm", "apt", "go"], |modes| {
+        (modes.len() > 1).then(|| "unexpected failure".to_owned())
+    });
+
+    assert!(report.degradations().next().is_none());
+    assert_eq!(
+        report.add_envs,
+        BTreeMap::from(
+            [
+                ("APT_HOME", "set"),
+                ("GO_HOME", "set"),
+                ("NPM_HOME", "set"),
+                ("SHARED", "npm")
+            ]
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        )
+    );
+}
+
+#[test]
+fn global_mount_reports_every_mode_when_all_fail() {
+    let (report, calls) = mount_global_modes(&["apt", "go"], |modes| {
+        Some(format!("planning {}: failed", modes[0]))
+    });
+    assert_eq!(calls, [vec!["apt", "go"], vec!["go"]]);
+    assert_eq!(degraded_modes(&report), [["apt"], ["go"]]);
+    assert!(report.mounted_paths.is_empty());
+    assert!(report.add_envs.is_empty());
+
+    let (report, calls) = mount_global_modes(&["apt", "go"], |_| Some("device busy".to_owned()));
+    assert_eq!(calls, [vec!["apt", "go"], vec!["apt"], vec!["go"]]);
+    assert_eq!(degraded_modes(&report), [["apt"], ["go"]]);
+    assert!(report.add_envs.is_empty());
+}
+
 #[test]
 fn repository_mount_paths_resolve_destinations_within_repository() {
     let temp = tempfile::tempdir().unwrap();
