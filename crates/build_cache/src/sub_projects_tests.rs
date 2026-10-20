@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5,8 +6,38 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use command::r#async::Command;
 use futures::executor::block_on;
 
-use super::{CargoWorkspace, ModeLocality, mode_locality, needs_dry_run};
+use super::{CargoWorkspace, ModeLocality, classified_mode_locality, mode_locality, needs_dry_run};
 use crate::CacheSetupError;
+
+/// Modes provided by spacectl 0.12.2, the version the cloud agent image installs
+/// (`SPACECTL_VERSION` in warpdotdev/warp-agent-docker's `lib/build-tools.sh`).
+const SPACECTL_MODES: &[&str] = &[
+    "apt",
+    "brew",
+    "bun",
+    "cocoapods",
+    "composer",
+    "deno",
+    "go",
+    "golangci-lint",
+    "gradle",
+    "kotlin-native",
+    "maven",
+    "mise",
+    "nix",
+    "npm",
+    "playwright",
+    "pnpm",
+    "poetry",
+    "python",
+    "ruby",
+    "rust",
+    "swiftpm",
+    "tuist",
+    "uv",
+    "xcode",
+    "yarn",
+];
 
 fn modes(names: &[&str]) -> Vec<String> {
     names.iter().map(ToString::to_string).collect()
@@ -43,6 +74,45 @@ fn decide(
         workspace,
         &|_: Command| futures::future::ready(metadata.clone()),
     ))
+}
+
+#[test]
+fn every_spacectl_mode_is_classified() {
+    let unclassified = SPACECTL_MODES
+        .iter()
+        .filter(|mode| classified_mode_locality(mode).is_none())
+        .collect::<Vec<_>>();
+    assert!(
+        unclassified.is_empty(),
+        "classify {unclassified:?} in `classified_mode_locality` by reading their providers in \
+         spacectl's internal/cache/mode/providers.go"
+    );
+}
+
+/// Runs wherever spacectl is installed, such as cloud agent sandboxes, so that upgrading spacectl
+/// cannot silently add modes that this table treats as unknown.
+#[test]
+fn installed_spacectl_modes_are_classified() {
+    let Ok(output) = command::blocking::Command::new("spacectl")
+        .args(["cache", "modes", "-o", "json"])
+        .output()
+    else {
+        return;
+    };
+    assert!(output.status.success(), "spacectl cache modes failed");
+    let response = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    let unclassified = response["modes"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|mode| classified_mode_locality(mode).is_none())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        unclassified.is_empty(),
+        "the installed spacectl provides cache modes {unclassified:?} that are not classified; \
+         classify them in `classified_mode_locality` and update SPACECTL_MODES and its version \
+         if the agent image installs this spacectl"
+    );
 }
 
 #[test]

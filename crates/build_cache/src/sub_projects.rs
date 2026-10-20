@@ -34,8 +34,14 @@ pub(super) enum ModeLocality {
     Repository,
 }
 
+/// Classifies `mode`. Modes this table does not know about may mount anything, so they are
+/// treated as [`ModeLocality::Repository`].
 pub(super) fn mode_locality(mode: &str) -> ModeLocality {
-    match mode {
+    classified_mode_locality(mode).unwrap_or(ModeLocality::Repository)
+}
+
+fn classified_mode_locality(mode: &str) -> Option<ModeLocality> {
+    Some(match mode {
         "apt" | "brew" | "composer" | "deno" | "go" | "golangci-lint" | "gradle"
         | "kotlin-native" | "maven" | "mise" | "nix" | "playwright" | "python" | "tuist"
         | "xcode" => ModeLocality::Global,
@@ -47,9 +53,9 @@ pub(super) fn mode_locality(mode: &str) -> ModeLocality {
         // Yarn 2 and 3 default to a project-local cache, which they keep under `.yarn`.
         "yarn" => ModeLocality::ProjectConfigurable(&[".npmrc", ".yarn", ".yarnrc", ".yarnrc.yml"]),
         "rust" => ModeLocality::CargoTarget,
-        // `cocoapods`, `ruby`, and `swiftpm`, as well as modes this table does not know about.
-        _ => ModeLocality::Repository,
-    }
+        "cocoapods" | "ruby" | "swiftpm" => ModeLocality::Repository,
+        _ => return None,
+    })
 }
 
 /// Members of the Cargo workspace containing a repository root, resolved at most once.
