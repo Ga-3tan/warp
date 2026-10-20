@@ -2,23 +2,25 @@
 
 ## Summary
 [QUALITY-2186](https://linear.app/warpdotdev/issue/QUALITY-2186/restore-local-child-owners-after-cloud-parent-vm-idle-destroyhandoff) affects a cloud parent that resumes after its VM is destroyed.
-The new VM can show the parent's children, but it cannot receive messages for native (Oz) children that ran locally in the old VM.
-Restore each child's **owner** in the new parent process before the parent can send it a message.
+The new VM can show the parent's children, but it cannot receive messages for native (Oz) descendants that ran locally in the old VM.
+Restore the co-resident native-local **subtree**, not only the root's direct children.
+Each descendant keeps its immediate parent and its own execution conversation in the resumed root process.
 Subscribe to the child's events immediately; load its full conversation only on its first message or pane open.
-Implementation and validation follow this contract.
+The subtree contract below is proposed for approval; implementation must wait for that approval.
 
 ## Handoff contract
 1. Child restoration inherits the parent's existing handoff and workload-credential safeguards. Do not require an additional physical-VM-destruction barrier or introduce child-specific fencing; predecessor teardown may still be in progress.
-2. VM B restores the parent's conversation and environment. It discovers **all direct children** through one complete, paginated server traversal.
-3. VM B creates one lightweight owner for each native/Oz child classified `LOCAL`. The parent may resume only after each eligible child is listening or explicitly in `Error`. Owner-setup failure affects that child, not the parent's ability to recover. Remote and non-Oz children do not get new owners here.
-4. When the parent sends to a local child, that child's event wakes its owner. The owner loads the existing transcript, then replays and delivers the message. Failed hydration puts that child in `Error` without executing a turn.
+2. VM B restores the root's conversation and environment. It discovers all direct children, then repeats complete, paginated discovery beneath each native/Oz child classified `LOCAL`. Stop at every remote or non-Oz child.
+3. VM B creates one lightweight owner per eligible descendant. The root and restored descendants may execute only after the entire discovered subtree is listening or explicitly in `Error`. Owner-setup failure affects that run, not its siblings or descendants.
+4. A running parent at any recovered level can send to its existing direct local child. For `P → local C → local G`, both C and G are restored before execution resumes. C's message wakes G, which loads its existing transcript before delivery. Failed hydration puts only that child in `Error`.
 5. Desktop viewers and the Observer show passive child representations. Viewing a cloud parent's child never makes the desktop the child's owner.
 
 ### Terms
 - **Parent / child:** An orchestrator run and one of its direct child runs. `ancestor_run_id` lists direct children, not all descendants.
+- **Root / co-resident subtree:** The resumed cloud run and descendants reachable through only native/Oz `LOCAL` edges. A descendant below a remote or non-Oz hop is outside this recovery pass, even if that descendant is labeled `LOCAL`.
 - **Local owner:** The in-process child conversation, hidden terminal pane, controller, and event consumer that can execute a native child's turn and acknowledge its inbox. `LOCAL` is a persisted worker classification, **not** proof that an owner is alive.
 - **Viewer / placeholder:** A read-only representation for the pill bar or transcript. It cannot consume or confirm the child's inbox. A cloud-owned parent shown on a desktop has viewers, not local child owners on that desktop.
-- **Seed / discovery:** The initial server list of direct children. One shared helper traverses the pages. Headless restoration, desktop `PaneGroup`, and the Observer each decide what to do with the result.
+- **Seed / discovery:** One shared helper traverses a parent's direct-child pages. Headless restoration composes these lists into a subtree. Desktop `PaneGroup` and Observer seeds keep their existing direct-child scope.
 - **SSE / cursor:** Server-Sent Events notify a process about run events. A cursor is the last sequence already processed or acknowledged. The parent's ancestor stream does **not** deliver a child's inbox; the child needs its own run stream.
 - **Hydration:** Fetch and install the child's existing conversation transcript into its lightweight owner before it can execute another turn.
 
@@ -26,17 +28,26 @@ Implementation and validation follow this contract.
 ```mermaid
 flowchart TD
     API["Server: corrected run labels and paginated direct-child list"] --> D["Shared strict discovery: complete list or error"]
-    D --> H["Headless parent in VM B"]
+    D --> H["Headless subtree traversal in VM B"]
+    H -->|"Each native LOCAL child becomes a parent"| D
     D --> G["Desktop PaneGroup"]
     D --> O["Observer viewer"]
-    H --> L["Native LOCAL: owner and own-run wake listener"]
+    H -->|"Whole traversal succeeds"| L["Each native LOCAL descendant: owner and own-run wake listener"]
     H --> R["Other children: no new owner"]
-    L --> P["Parent turn may resume"]
+    L --> P["All listeners or Error: release subtree startup"]
     R --> P
     G --> V["Reconcile existing owners or passive placeholders"]
     O --> S["Passive pills, then ancestor SSE"]
 ```
 The diagram shows a shared **algorithm**, not one shared cache or process. The three consumers retain separate readiness gates, retries, and lifetimes.
+
+## Context
+The implementation candidate at `af4709b220226c5ee87c79e17585c61f9932ed0d` restores only one level in [`driver/restored_children.rs:6-167`](https://github.com/warpdotdev/warp/blob/af4709b220226c5ee87c79e17585c61f9932ed0d/app/src/ai/agent_sdk/driver/restored_children.rs#L6-L167).
+[`discovery.rs:8-83`](https://github.com/warpdotdev/warp/blob/af4709b220226c5ee87c79e17585c61f9932ed0d/app/src/ai/ambient_agents/discovery.rs#L8-L83) validates each immediate-parent list; it does not traverse descendants.
+[`restored_owners.rs:25-106`](https://github.com/warpdotdev/warp/blob/af4709b220226c5ee87c79e17585c61f9932ed0d/app/src/pane_group/child_agent/restored_owners.rs#L25-L106) already accepts a parent conversation and terminal, so nested restoration can reuse the same pane lifecycle.
+Passive snapshot application in [`history_model.rs:655-674`](https://github.com/warpdotdev/warp/blob/af4709b220226c5ee87c79e17585c61f9932ed0d/app/src/ai/blocklist/history_model.rs#L655-L674) and the terminal-only status guard in [`driver.rs:3853-3994`](https://github.com/warpdotdev/warp/blob/af4709b220226c5ee87c79e17585c61f9932ed0d/app/src/ai/agent_sdk/driver.rs#L3853-L3994) also need execution-conversation isolation.
+The companion server at `2986008bb56b098c0919779b0a686d0e38224ab7` already authorizes all-local descendant updates in [`update_agent_task.go:55-148`](https://github.com/warpdotdev/warp-server/blob/2986008bb56b098c0919779b0a686d0e38224ab7/logic/ai/ambient_agents/update_agent_task.go#L55-L148).
+Subtree restoration must preserve that authorization and its locked revalidation, not broaden it across remote hops.
 
 ## Design
 ### 1. Make the server's location label consistent
@@ -56,21 +67,39 @@ The diagram shows a shared **algorithm**, not one shared cache or process. The t
 - Fail the entire traversal if a required next cursor is missing, empty, or repeated; a run row cannot decode; its `execution_location` is missing; its `parent_run_id` differs from the requested parent; or repeated data for the same run ID conflicts on parent, location, or harness. Ignore an accidental parent row. Deduplicate identical run IDs in first-seen order.
 - Return either the full traversal or an error. No consumer acts on a partial result. Pagination is **not an atomic snapshot**: another child can appear while pages are read. Do not add a global seed cache.
 
-### 3. Restore owners in the resumed headless parent
-**Why:** The headless `AgentDriver` restores its own conversation and event consumer, but it does not currently list children. The server does not wake a local run on its behalf.
+### 2a. Compose a complete native-local subtree
+**Why:** Listing only P's children restores C but leaves C's existing local child G without a controller or wake listener.
 
-- After the parent's conversation and environment exist, await the shared discovery before the first resumed turn **or** `--skip-initial-turn` completion. Retry transient list failures before releasing the parent. A permanent or persistently incomplete traversal is a parent setup error; do not start its turn.
-- Create owners only for `LOCAL` native/Oz children. An absent harness defaults to Oz as in the existing task bootstrap. An unknown or explicitly non-Oz harness never becomes a native owner. Remote and non-Oz rows remain passive observations.
-- Reuse each child's existing run ID, server conversation token, parent conversation ID, title, harness, and the parent's restored working directory. A missing usable token enters the child Error path; never create a replacement server run or transcript.
-- `TerminalDriver::create` already opens a root workspace with a `PaneGroup`. Retain that group's handle for `AgentDriver`; find the parent pane by terminal-view ID. In the group's `ViewContext`, create a metadata-only **owner** conversation indexed by the child's existing run ID and bound to its existing token. Restore it through `PaneGroup::create_hidden_child_agent_pane`. The child gets a separate controller, terminal surface, and own-run event consumer. A hidden shell in the same workspace is allowed; another VM or workspace is not.
-- Keep a run-ID-to-owner map and reconcile it with the history model's run-ID index. Repeated seeds, SSE reconnects, and restoration must not create a second owner, pane, or consumer. If a passive placeholder raced ahead of the owner, replace or promote it without losing the run-ID mapping. A placeholder must not suppress owner creation.
-- If an individual pane, controller, or shell cannot be initialized, mark that child `Error` locally and on the server, leave its execution gate closed, and allow the parent to continue and recover. Never silently skip an eligible child.
+- Add a headless subtree discovery helper beside `discover_direct_children` in `app/src/ai/ambient_agents/discovery.rs`. Keep direct-child API semantics and desktop/Observer call sites unchanged.
+- Use an iterative, parent-first queue starting at the resumed root run ID. For each queued parent, await its complete direct-child traversal. Retain that batch with its immediate parent run ID, including remote/non-Oz rows for passive representation.
+- Enqueue only native/Oz `LOCAL` children. Use one eligibility predicate for discovery and setup, outside `PaneGroup`; an absent harness defaults to Oz, while an unknown or non-Oz harness stops traversal.
+- Track discovered run IDs and their parent/location/harness metadata across the whole pass. Deduplicate identical rows without another visit. Reject conflicting identities, a root returned as a descendant, or a cycle; never flatten descendants under the root.
+- Finish every eligible branch, including children of a run with a missing conversation token. Tokens and pane setup are per-run failures after discovery, not reasons to hide an existing branch.
+- Return parent-first batches only after all queued lists succeed. Apply no conversations, panes, listeners, or task status updates from a partial traversal. Retry transient failure with the bounded headless retry policy; a permanent or exhausted failure anywhere blocks root setup.
+- Do not fetch transcripts during discovery. This traversal is not an atomic tree snapshot; children absent from all list results remain subject to the existing concurrent-creation limitation, not a new scan or polling loop.
+
+### 3. Restore owners in the resumed headless parent
+**Why:** Every recovered native-local run needs its own controller and inbox consumer. Restoring an ancestor's transcript does not restore those execution surfaces.
+
+- After the root's conversation and environment exist, await complete subtree discovery before the first resumed turn **or** `--skip-initial-turn` completion. Do not release the root after only its direct-child batch.
+- Create owners in parent-first order only for `LOCAL` native/Oz descendants. Remote and non-Oz rows remain passive observations under their actual parent.
+- Maintain a run-ID-to-local-conversation mapping seeded with the root. Establish each child's immediate `parent_agent_id` and `parent_conversation_id` from that mapping. Stamp its shell's task and parent environment variables with the child run ID and immediate parent run ID, not the root run ID.
+- Reuse each child's existing run ID, server conversation token, title, harness, and the root's restored working directory and environment. A missing usable token enters that child's Error path; never create a replacement server run or transcript. Descendants keep their actual parent link through hydration.
+- `TerminalDriver::create` already opens a root workspace with a `PaneGroup`. Retain that group's handle for `AgentDriver`. In the group's `ViewContext`, create each metadata-only execution conversation and reuse `PaneGroup::create_hidden_child_agent_pane`. Each child gets a separate controller, terminal surface, and own-run event consumer in that same workspace.
+- Use the immediate parent's pane as the physical insertion anchor when available. If that parent's setup failed before its pane existed, keep its metadata conversation and use the root pane only as an insertion fallback. This must not reparent the descendant or mark it failed because its parent failed.
+- Hold a subtree startup gate independently of per-child transcript hydration. A wake or pane open may start hydration during setup, but normal inbox delivery and controller execution require both startup release and successful hydration. Register every successful child's wake listener, account for every failed child as Error, then release startup for the pass and allow the root to continue.
+- A listener that already woke and paused for hydration counts as registered for startup. Keep its wake and unchanged cursor until replay can start. Startup does not wait for every transcript or a new network event; releasing the gate must re-evaluate pending work.
+- Keep a run-ID-to-owner map and reconcile it with the history model's run-ID index. Repeated seeds, SSE reconnects, and restoration must not create a second owner, pane, or consumer. Preserve an existing live execution conversation's status, hydration, cursor, and open gate rather than restarting it. If a passive placeholder raced ahead of the owner, replace or promote it without losing the run-ID mapping. A placeholder must not suppress owner creation.
+- If an individual pane, controller, or shell cannot be initialized, mark that child `Error` locally and on the server and leave its execution gate closed. Continue preparing its descendants and siblings; never silently skip an eligible run or use a cached Success to hide the failure.
+- Use `prepare_restored_child` and `register_restored_child` for the child-conversation helpers. Keep authority predicates such as `owns_turn_lifecycle`; do not introduce an additional owner object.
 
 ### 4. Keep desktop and Observer consumers passive
 **Desktop `PaneGroup`:**
 - Use the shared discovery in `spawn_ancestor_list_fetch_if_needed`. Keep its pending-parent map, in-flight dispatch token, task-resolution retries, five-second transient retry, terminal-surface check, and hidden-pane reconciliation.
 - Preserve hidden child panes that a **locally owned** GUI parent already owns. When the desktop views a **cloud-owned** parent, every discovered child is a passive placeholder, even if its label says `LOCAL`. Never claim a child just because of that label.
-- In the headless parent's own workspace, defer passive GUI seeding until its owner pass finishes; then keep its local owner mappings and add remote placeholders.
+- In the headless workspace, defer passive GUI seeding until the entire subtree pass finishes. Keep execution-conversation mappings at every level and add passive placeholders beneath the corresponding immediate parent.
+- Apply task snapshots only to passive child placeholders, using their conversation role rather than `execution_location`. An existing execution conversation must retain its status, restoration diagnostic, hydration state, terminal binding, and immediate-parent link. Enforce this at the shared snapshot application boundary so every passive seed caller obeys it.
+- Guard the native `AgentDriver` status handler with its bound conversation ID as well as its terminal ID. A child status event must never complete, schedule, or cancel the parent's exit, even if a producer supplies the parent's terminal ID. Preserve fresh-run conversation binding.
 
 **Observer:**
 - Use the same discovery in `OrchestrationEventStreamer::spawn_ancestor_seed_fetch`. Seed `known_children` as passive pills for both locations. Do not create owners or read child inboxes.
@@ -107,18 +136,19 @@ sequenceDiagram
         Note over C: No turn, cursor advance, or delivery confirmation
     end
 ```
-- Give each owner `Unhydrated → Hydrating → Ready | Error` state. Before `Ready`, its own `RunIds([child_run_id])` SSE is **wake-only**. The parent's ancestor SSE sees child lifecycle but cannot replace this listener.
+- Give each owner `Unhydrated → Hydrating → Ready | Error` state. Before `Ready`, its own `RunIds([child_run_id])` SSE is **wake-only**. Normal delivery also requires subtree startup release. The parent's ancestor SSE sees child lifecycle but cannot replace this listener, including for a child that is itself a recovered parent.
 - Seed the child's cursor from its durable acknowledged sequence at discovery, or zero if absent. Do not merge a newer server cursor while the child is unhydrated; bypass the existing `spawn_task_harness_fetch_if_needed` / `finish_restore_fetch` max-with-server path. A wake event must not fetch or enqueue message contents, advance or persist/ack a cursor, mark mail delivered, or start an LLM turn.
 - On wake, stop the wake-only listener and hydrate. A pane open also triggers hydration without mail. Coalesce simultaneous wake/pane-open requests into one operation per run ID.
-- Fetch the **existing** server conversation token through `get_ai_conversation`. Convert using `RestorationMode::Continue` and the lightweight owner's existing `AIConversationId`, not a new ID. Merge transcript and metadata into that owner. Preserve run ID, parent link, child role, and terminal surface. Only after installation, restart normal child SSE from the unchanged durable cursor; replay, fetch, enqueue, and deliver pending mail; then release the child's controller gate. Do not resume an interrupted in-memory turn. The persisted transcript is authoritative, and the next delivered message starts the next turn. The parent may send after metadata restoration; only child injection waits for full hydration.
+- Fetch the **existing** server conversation token through `get_ai_conversation`. Convert using `RestorationMode::Continue` and the lightweight owner's existing `AIConversationId`, not a new ID. Merge transcript and metadata into that owner. Preserve run ID, immediate-parent link, child role, terminal surface, and subtree startup gate. Once installation and subtree startup both finish, restart normal child SSE from the unchanged durable cursor; replay, fetch, enqueue, and deliver pending mail; then release the child's controller gate. Do not resume an interrupted in-memory turn. The persisted transcript is authoritative, and the next delivered message starts the next turn. Hydrating C must neither create a second G nor be required to discover G.
 - If fetch, decode, conversion, or installation fails, stop the child's wake listener and leave normal delivery blocked. Set **both** local conversation and server task to `Error` with child run ID and failed stage. Use `AIClient::update_agent_task`/status reporting or the smallest explicit equivalent if normal sync requires a turn. Do not execute a request, confirm delivery, or automatically retry the failed child. Surface an Error-reporting failure rather than claiming success. A later deliberate restoration can retry only by creating a new owner from durable state. Other children stay active.
 
 ## Boundaries and trade-offs
 - **Parent-equivalent safety:** Reuse the parent's existing handoff and inherited-workload-credential safeguards. Physical VM teardown need not finish before restoration. The child uses the parent's restored files; do not add a new destruction barrier, child-specific fencing, child snapshots, or a second workspace.
-- **Narrow message scope:** Only a *running parent* sending to its *direct native/Oz local child* is covered. No messages sent while the parent VM is absent, child-to-parent or external-to-child delivery, undelivered-inbox scan, periodic poll, or `read_at` change. The `read_at` timing fix is separate.
+- **Narrow message scope at every recovered level:** A *running parent* sending to its *direct native/Oz local child* is covered, including recovered C sending to existing G. No messages sent while the root VM is absent, child-to-parent or external-to-child delivery, undelivered-inbox scan, periodic poll, or `read_at` change. The `read_at` timing fix is separate.
+- **Subtree, not a flattened child list:** Direct-child-only recovery leaves supported local grandchildren unable to receive mail. Recursively compose the existing lists instead of adding a new server endpoint or waiting for ancestor transcripts. The extra list requests are required startup work; remote and non-Oz boundaries prevent claiming runs with another execution lifecycle.
 - **Metadata now, transcript later:** Eager full history would simplify the first message but slow handoff as histories grow. Metadata-only owners subscribe before the parent resumes and fetch only on wake/open.
 - **Correct the field, not a new one:** A new ownership field would keep the old response's accidental live-execution meaning but increase contract and client rollout work. Correcting `execution_location` aligns response and filters; decouple session-link eligibility to avoid a stale join link.
-- **One traversal, three lifecycles:** A global seed/cache could share in-flight work but conflate headless readiness, desktop retries, and Observer permissions/cursors. Share only strict page traversal.
+- **One direct-child algorithm, three lifecycles:** A global seed/cache could share in-flight work but conflate headless readiness, desktop retries, and Observer permissions/cursors. Share strict page traversal; compose it into a subtree only for headless recovery.
 - **Existing pane, not another terminal factory:** Headless `TerminalDriver` already has a `PaneGroup`. Its hidden child pane provides a separate controller and terminal without duplicating terminal lifecycle setup.
 - **Replay, not max-child cursor:** Observer replay costs historical events. The max-child shortcut could silently lose concurrent child discovery; use local processed cursor and deduplication.
 - **Wake and Error, not premature delivery or blank continuation:** Normal SSE before hydration can skip or execute mail with no context. Gate it; an unhydratable child enters Error rather than inventing a fresh conversation. Do not change the existing dormant-Claude wake bridge.
@@ -127,7 +157,8 @@ sequenceDiagram
 ### Assumptions to verify
 - A resumable native local child has a server conversation token and server transcript. Missing either is a child Error, not permission to start fresh.
 - Parent environment restoration finishes before child owner creation; no child-specific workspace reconstruction is required.
-- A failed or malformed list blocks parent execution; child transcript failure affects only that child after complete discovery.
+- Native/Oz `LOCAL` edges identify the co-resident portion of the tree, using the same persisted-worker classification as direct-child restoration. The wire field is not a lease; existing server authority checks still reject a superseding remote execution.
+- A failed or malformed list anywhere in that subtree blocks root execution. Token, owner-setup, or transcript failure affects only the failed run after complete discovery.
 - Server-first rollout is operationally confirmed per environment. The existing wire response cannot prove that an older server's valid `REMOTE` is correct.
 
 ## Validation criteria for implementation
@@ -137,6 +168,7 @@ execution, driver pagination/`--skip-initial-turn` barriers, and remaining race/
 requester-owned local integration checks, not factory pre-handoff gates. The scenarios below remain
 the acceptance checklist; an unrun scenario is not a passing result. UI verification is declined.
 Add Rust cases adjacent to `app/src/pane_group/child_agent/restoration.rs`, `app/src/ai/blocklist/orchestration_event_streamer.rs`, `app/src/server/server_api/ai.rs`, and `app/src/ai/agent_sdk/driver.rs`. Run named cases from `warp` with `cargo nextest run -p warp --lib -E 'test(restored_local_child_)'`; run `cargo check -p warp` and `cargo clippy -p warp --all-targets --tests -- -D warnings`. Run server checks from `warp-server` with `go test ./router/handlers/public_api ./test/integration/ambient_agents` and the integration database configured.
+The subtree and lifecycle-isolation component regressions below are factory checks before implementation delivery; they do not require paired servers or UI verification. The real cross-VM scenario remains requester-owned. Also run the wasm gate, `cargo clippy --locked --target wasm32-unknown-unknown --profile release-wasm-debug_assertions -- -D warnings`, before the final formatter.
 
 ### API labels and rollout
 - Extend `TestConvertTasksToItems_ExecutionLocation` (`warp-server/router/handlers/public_api/agent_webhooks_test.go:1945-2010`). An ended `worker_id=local` run with no active execution and `source=ORCHESTRATION` returns `LOCAL`; nonlocal and unset/NULL workers return `REMOTE`.
@@ -147,6 +179,17 @@ Add Rust cases adjacent to `app/src/pane_group/child_agent/restoration.rs`, `app
 ### Strict discovery
 - `restored_local_child_discovery_pages` returns 101+ mixed-location children over multiple pages, a repeated run ID, and a child created while paging. Assert `created_at asc`, a complete deduplicated result, and no partial application.
 - Reject malformed rows, missing locations, wrong parents, conflicting duplicate parent/location/harness, and missing, empty, or repeated next cursors.
+
+### Native-local subtree and lifecycle isolation
+- `restored_local_child_subtree_discovery` lists a paginated `P → local C → local G` chain and a local sibling. Assert parent-first results, each immediate-parent link, deduplication, and no transcript fetch. Include remote and non-Oz branches: neither their child lists nor their local descendants are claimed.
+- `restored_local_child_subtree_incomplete` fails a later page beneath C and supplies a conflicting run identity or root cycle. Each case returns no applicable subtree; no earlier sibling receives a conversation, listener, or task update.
+- `restored_local_child_subtree_startup_gate` delays G's setup while a wake hydrates C. Assert no normal mail delivery or C request before every eligible run is listening or Error. Startup release must then allow C's pending work without an extra wake.
+- `restored_local_child_subtree_message` uses the mocked client and normal client message/event path after recovery. C sends to G's existing run ID; observe G's lazy transcript installation, replay, and next request. Assert one G conversation/controller/listener, preserved C-to-G IDs and environment parent ID, and no new server run. Constructing a G stub alone is not this proof.
+- `restored_local_child_subtree_setup_failure` fails C's token or pane setup and successfully prepares G and a sibling. Assert local/server Error only for C, G still linked to C and listening, and root startup released without flattening or silently skipping G.
+- `restored_local_child_deferred_seed_after_hydration` completes a stale Success seed after the execution child is hydrated and running. Assert its execution status is unchanged and the parent's completion signal stays pending with no idle window.
+- `restored_local_child_deferred_seed_after_failure` completes a stale seed after child restoration Error. Assert the diagnostic and closed execution gate survive, while a passive sibling's badge still updates.
+- `restored_local_child_driver_status_isolation` emits a child's status event with the parent's terminal ID. Assert no parent exit or idle scheduling; an event for the bound parent conversation must still settle the parent.
+- Preserve server descendant authorization by running `go test ./logic/ai/ambient_agents -run 'TestUpdateAgentTask(LocalGrandchildOfRequesterAllowed|DescendantChainThroughRemoteHopRejected)'`. These existing tests check the authorization boundary; they do not establish cross-VM execution.
 
 ### VM A → B
 - `restored_local_child_vm_a_to_b` restores the parent and child in B, then sends parent-to-child mail. Preserve the existing parent handoff and inherited-credential fencing checks; physical teardown of A may still be in progress.
@@ -170,7 +213,7 @@ Add Rust cases adjacent to `app/src/pane_group/child_agent/restoration.rs`, `app
 ### Child wake, races, and failure
 - `restored_local_child_hydration_gate` delays transcript load while two SSE wakes and a pane open arrive. Assert one load, no cursor/delivery advance or child request before hydration, then one replay and one turn. Re-seed and reconnect without duplicates.
 - `restored_local_child_transcript_error` fails fetch, decode, and conversion separately. Assert local and server Error, no child request or delivery confirmation, and other children still owned. A failed Error update must be visible.
-- Owner-setup failure marks only that child Error, leaves its execution gate closed, and allows the parent to recover after complete discovery.
+- Owner-setup failure marks only that child Error, leaves its execution gate closed, and permits the remaining subtree and root to recover after complete discovery.
 
 ## Implementation map
 - Headless bootstrap and owner lifecycle: [`app/src/ai/agent_sdk/driver.rs:1102-1410`](https://github.com/warpdotdev/warp/blob/1e1acb4d74b3f55155860a785152bd23a2f3d83b/app/src/ai/agent_sdk/driver.rs#L1102-L1410), [`app/src/ai/agent_sdk/driver.rs:3441-3590`](https://github.com/warpdotdev/warp/blob/1e1acb4d74b3f55155860a785152bd23a2f3d83b/app/src/ai/agent_sdk/driver.rs#L3441-L3590), [`app/src/ai/agent_sdk/driver/terminal.rs:214-265`](https://github.com/warpdotdev/warp/blob/1e1acb4d74b3f55155860a785152bd23a2f3d83b/app/src/ai/agent_sdk/driver/terminal.rs#L214-L265), [`app/src/pane_group/mod.rs:2216-2229`](https://github.com/warpdotdev/warp/blob/1e1acb4d74b3f55155860a785152bd23a2f3d83b/app/src/pane_group/mod.rs#L2216-L2229).
