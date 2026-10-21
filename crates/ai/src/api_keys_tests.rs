@@ -8,6 +8,51 @@ use super::*;
 fn make_manager(keys: ApiKeys) -> ApiKeyManager {
     make_manager_with_grok(keys, None)
 }
+
+#[test]
+fn endpoint_params_update_computer_use_toolsets() {
+    warpui_core::App::test((), |mut app| async move {
+        app.update(|ctx| warpui_extras::secure_storage::register_noop("test", ctx));
+        let manager = app.add_singleton_model(ApiKeyManager::new);
+        let params = CustomEndpointParams {
+            name: "Gateway".into(),
+            url: "https://gateway.example/v1".into(),
+            api_key: "key".into(),
+            schema: CustomEndpointSchema::AnthropicMessages,
+            models: vec![CustomEndpointModel {
+                name: "model".into(),
+                config_key: "stable-key".into(),
+                computer_use_toolset: ComputerUseToolset::AnthropicComputer20250124,
+                ..Default::default()
+            }],
+        };
+        manager.update(&mut app, |manager, ctx| {
+            manager.add_custom_endpoint(params.clone(), ctx);
+        });
+        manager.read(&app, |manager, _| {
+            assert_eq!(
+                manager
+                    .custom_model_providers_for_request(true)
+                    .unwrap()
+                    .providers[0]
+                    .models[0]
+                    .computer_use_toolset,
+                ComputerUseToolset::AnthropicComputer20250124 as i32
+            );
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            let mut params = params;
+            params.models[0].computer_use_toolset = ComputerUseToolset::None;
+            manager.save_custom_endpoint(0, params, ctx);
+        });
+        manager.read(&app, |manager, _| {
+            let providers = manager.custom_model_providers_for_request(true).unwrap();
+            assert_eq!(providers.providers[0].models[0].config_key, "stable-key");
+            assert_eq!(providers.providers[0].models[0].computer_use_toolset, 0);
+        });
+    });
+}
 #[test]
 fn aws_credentials_are_cleared_only_when_refresh_strategy_changes() {
     warpui_core::App::test((), |mut app| async move {

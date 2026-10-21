@@ -643,7 +643,7 @@ pub struct CustomEndpointParams {
     pub name: String,
     pub url: String,
     pub api_key: String,
-    pub models: Vec<(String, Option<String>, Option<String>)>,
+    pub models: Vec<CustomEndpointModel>,
     pub schema: CustomEndpointSchema,
 }
 fn provider_credential_action(is_present: bool) -> ProviderCredentialTelemetryAction {
@@ -1037,13 +1037,11 @@ impl ApiKeyManager {
             schema,
             models: models
                 .into_iter()
-                .map(|(name, alias, config_key)| CustomEndpointModel {
-                    name,
-                    alias,
-                    config_key: config_key
-                        .filter(|k| !k.is_empty())
-                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
-                    computer_use_toolset: ComputerUseToolset::None,
+                .map(|mut model| {
+                    if model.config_key.trim().is_empty() {
+                        model.config_key = Uuid::new_v4().to_string();
+                    }
+                    model
                 })
                 .collect(),
         });
@@ -1070,11 +1068,6 @@ impl ApiKeyManager {
             models,
             schema,
         } = params;
-        let saved_toolsets: HashMap<_, _> = self.keys.custom_endpoints[index]
-            .models
-            .iter()
-            .map(|model| (model.config_key.clone(), model.computer_use_toolset))
-            .collect();
         self.keys.custom_endpoints[index] = CustomEndpoint {
             name,
             url,
@@ -1082,17 +1075,11 @@ impl ApiKeyManager {
             schema,
             models: models
                 .into_iter()
-                .map(|(name, alias, config_key)| CustomEndpointModel {
-                    name,
-                    alias,
-                    computer_use_toolset: config_key
-                        .as_ref()
-                        .and_then(|key| saved_toolsets.get(key))
-                        .copied()
-                        .unwrap_or_default(),
-                    config_key: config_key
-                        .filter(|k| !k.is_empty())
-                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                .map(|mut model| {
+                    if model.config_key.trim().is_empty() {
+                        model.config_key = Uuid::new_v4().to_string();
+                    }
+                    model
                 })
                 .collect(),
         };

@@ -1,50 +1,44 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use ai::api_keys::CustomEndpointSchema;
+use ai::api_keys::{ComputerUseToolset, CustomEndpointModel, CustomEndpointSchema};
 use settings::Setting as _;
 use warpui::{App, SingletonEntity as _};
 use warpui_extras::secure_storage;
 
 use super::*;
 use crate::settings::init_and_register_user_preferences;
+
 #[test]
-fn endpoint_edits_preserve_toolsets_by_stable_model_key() {
-    let saved = CustomEndpointDefinition {
-        name: "Gateway".into(),
-        base_url: "https://gateway.example/v1".into(),
+fn endpoint_params_supply_toolsets_for_existing_and_new_models() {
+    let edited = definition_from_params(CustomEndpointParams {
+        name: "Renamed gateway".into(),
+        url: "https://gateway.example/v1".into(),
+        api_key: "rotated-key".into(),
         schema: CustomEndpointSchema::AnthropicMessages,
-        models: vec![CustomEndpointModel {
-            name: "model".into(),
-            config_key: "pinned-key".into(),
-            computer_use_toolset: ai::api_keys::ComputerUseToolset::AnthropicComputer20251124,
-            ..Default::default()
-        }],
-    };
-    let edited = definition_from_params(
-        CustomEndpointParams {
-            name: "Renamed gateway".into(),
-            url: saved.base_url.clone(),
-            api_key: "rotated-key".into(),
-            schema: saved.schema,
-            models: vec![
-                (
-                    "model".into(),
-                    Some("Alias".into()),
-                    Some("pinned-key".into()),
-                ),
-                ("new".into(), None, None),
-            ],
-        },
-        Some(&saved),
-    );
+        models: vec![
+            CustomEndpointModel {
+                name: "model".into(),
+                alias: Some("Alias".into()),
+                config_key: "pinned-key".into(),
+                computer_use_toolset: ComputerUseToolset::None,
+            },
+            CustomEndpointModel {
+                name: "new".into(),
+                computer_use_toolset: ComputerUseToolset::AnthropicComputer20251124,
+                ..Default::default()
+            },
+        ],
+    });
+    assert_eq!(edited.models[0].config_key, "pinned-key");
+    assert!(!edited.models[1].config_key.is_empty());
     assert_eq!(
         edited.models[0].computer_use_toolset,
-        saved.models[0].computer_use_toolset
+        ComputerUseToolset::None
     );
     assert_eq!(
         edited.models[1].computer_use_toolset,
-        ai::api_keys::ComputerUseToolset::None
+        ComputerUseToolset::AnthropicComputer20251124
     );
 }
 

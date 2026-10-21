@@ -635,11 +635,11 @@ fn active_models_fall_back_to_usable_choice_or_custom_endpoint_when_default_disa
                     name: "local".to_string(),
                     url: "https://example.com/v1".to_string(),
                     api_key: "test-key".to_string(),
-                    models: vec![(
-                        "custom-model".to_string(),
-                        None,
-                        Some(custom_model_id.to_string()),
-                    )],
+                    models: vec![CustomEndpointModel {
+                        name: "custom-model".to_string(),
+                        config_key: custom_model_id.to_string(),
+                        ..Default::default()
+                    }],
                     schema: ai::api_keys::CustomEndpointSchema::default(),
                 },
                 ctx,
@@ -820,11 +820,12 @@ fn reconcile_preserves_custom_models_saved_on_execution_profile() {
                     name: "local".to_string(),
                     url: "https://example.com/v1".to_string(),
                     api_key: "test-key".to_string(),
-                    models: vec![(
-                        "custom-model".to_string(),
-                        Some("Custom Model".to_string()),
-                        Some(custom_model_id.to_string()),
-                    )],
+                    models: vec![CustomEndpointModel {
+                        name: "custom-model".to_string(),
+                        alias: Some("Custom Model".to_string()),
+                        config_key: custom_model_id.to_string(),
+                        ..Default::default()
+                    }],
                     schema: ai::api_keys::CustomEndpointSchema::default(),
                 },
                 ctx,
@@ -1401,6 +1402,30 @@ fn resetting_profiles_clears_session_computer_use() {
 
 #[cfg(not(target_family = "wasm"))]
 #[test]
+fn computer_use_model_falls_back_when_the_profile_is_unavailable() {
+    with_computer_use_test_context(|app| {
+        AIExecutionProfilesModel::handle(app).update(app, |profiles, ctx| {
+            profiles.set_computer_use_model(
+                &profiles.default_profile_id(),
+                Some("unknown-model".into()),
+                ctx,
+            );
+        });
+
+        LLMPreferences::handle(app).read(app, |preferences, ctx| {
+            assert_eq!(
+                preferences
+                    .get_active_computer_use_model(&TeamlessScopeForTest, ctx, None)
+                    .id
+                    .as_str(),
+                "computer-use-agent-auto"
+            );
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
 fn computer_use_model_override_takes_precedence_over_the_profile() {
     with_computer_use_test_context(|app| {
         let profiles = AIExecutionProfilesModel::handle(app);
@@ -1422,11 +1447,12 @@ fn computer_use_model_override_takes_precedence_over_the_profile() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .computer_use_model_id_for_request(
+                    .get_active_computer_use_model(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
+                    .id
                     .as_str(),
                 "computer-use-model"
             );
@@ -1456,11 +1482,12 @@ fn computer_use_default_override_ignores_the_profile_model() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .computer_use_model_id_for_request(
+                    .get_active_computer_use_model(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
+                    .id
                     .as_str(),
                 "computer-use-agent-auto"
             );
@@ -1486,11 +1513,12 @@ fn computer_use_model_falls_back_to_the_profile_without_a_terminal_override() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .computer_use_model_id_for_request(
+                    .get_active_computer_use_model(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
+                    .id
                     .as_str(),
                 "profile-model"
             );
@@ -1524,11 +1552,12 @@ fn clearing_computer_use_model_override_restores_the_profile_model() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .computer_use_model_id_for_request(
+                    .get_active_computer_use_model(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
+                    .id
                     .as_str(),
                 "profile-model"
             );
@@ -1538,10 +1567,17 @@ fn clearing_computer_use_model_override_restores_the_profile_model() {
 
 #[cfg(not(target_family = "wasm"))]
 #[test]
-fn computer_use_request_preserves_an_unavailable_explicit_model() {
+fn computer_use_model_falls_back_when_the_override_is_unavailable() {
     with_computer_use_test_context(|app| {
         let preferences = LLMPreferences::handle(app);
         let terminal_view_id = EntityId::new();
+        AIExecutionProfilesModel::handle(app).update(app, |profiles, ctx| {
+            profiles.set_computer_use_model(
+                &profiles.default_profile_id(),
+                Some("profile-model".into()),
+                ctx,
+            );
+        });
 
         preferences.update(app, |preferences, _| {
             preferences
@@ -1551,13 +1587,14 @@ fn computer_use_request_preserves_an_unavailable_explicit_model() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .computer_use_model_id_for_request(
+                    .get_active_computer_use_model(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
+                    .id
                     .as_str(),
-                "unknown-model"
+                "profile-model"
             );
         });
     });
@@ -1587,11 +1624,12 @@ fn resetting_session_model_overrides_restores_the_computer_use_profile_model() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .computer_use_model_id_for_request(
+                    .get_active_computer_use_model(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
+                    .id
                     .as_str(),
                 "profile-model"
             );

@@ -305,8 +305,10 @@ impl RequestInput {
             .get_active_cli_agent_model(scope, app, Some(terminal_surface_id))
             .id
             .clone();
-        let computer_use_model_id =
-            llm_prefs.computer_use_model_id_for_request(scope, app, Some(terminal_surface_id));
+        let computer_use_model_id = llm_prefs
+            .get_active_computer_use_model(scope, app, Some(terminal_surface_id))
+            .id
+            .clone();
         let working_directory = active_session
             .as_ref(app)
             .current_working_directory()
