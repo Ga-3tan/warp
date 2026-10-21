@@ -93,6 +93,7 @@ pub(super) fn repositories(
                 checkout,
                 clone_from,
                 preserve_origin: repo.preserve_origin,
+                expected_sha: repo.expected_sha,
             })
         })
         .collect()

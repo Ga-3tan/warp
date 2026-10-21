@@ -26,10 +26,10 @@ use warp_core::telemetry::TelemetryEvent;
 use warp_graphql::ai::AgentTaskState;
 use warpui::{App, SingletonEntity, WindowId};
 
+use super::driver::agent_setup::configured_skills::selected_execution_skills;
 use super::{
     AgentDriverRunner, CommandAuthentication, command_authentication, command_requires_auth,
     command_to_telemetry_event, reconcile_task_harness, resolve_agent_driver_team_scope,
-    selected_execution_skills,
 };
 use crate::ai::agent_sdk::driver::environment::WorkspaceConfiguration;
 use crate::ai::agent_sdk::driver::harness::HarnessKind;
@@ -66,6 +66,7 @@ const TASK_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 #[test]
 fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
     App::test((), |mut app| async move {
         let root = tempfile::TempDir::new().unwrap();
         let args =
@@ -73,9 +74,9 @@ fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
         let eager_repository = json!([{
             "forge": "GITHUB", "owner": "acme", "name": "api",
             "ref": {"type": "BRANCH", "value": "feature"},
-            "cloneFrom": null, "preserveOrigin": true,
+            "cloneFrom": null, "preserveOrigin": true, "expectedSha": null,
         }]);
-        for (use_factory_repositories, eager, deferred_forge) in [
+        for (supports_deferred_repositories, eager, deferred_forge) in [
             (true, json!([]), "GITLAB"),
             (true, eager_repository.clone(), "GITLAB"),
             (false, eager_repository, "UNSUPPORTED_FORGE"),
@@ -86,21 +87,27 @@ fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
                 "conversationId": null, "parentRunId": null, "teamId": null, "modelId": null,
                 "reasoningLevel": null, "profileId": null, "computerUseModelId": null,
                 "inferenceProviders": null, "providers": null,
-                "idleOnCompleteSeconds": null, "idleOnFailSeconds": null,
-                "mcpServersJson": "{}", "skills": [], "factorySkillDirs": [],
+                "idleOnCompleteSeconds": 120, "idleOnFailSeconds": 60,
+                "mcpServersJson": "{}", "skills": [], "factorySkillDirs": [".agents/skills"],
                 "computerUseEnabled": false, "repositories": eager,
                 "deferredRepositories": [{
-                    "codeForge": deferred_forge, "owner": "platform/backend", "repo": "api",
+                    "forge": deferred_forge, "owner": "platform/backend", "name": "api",
+                    "ref": {"type": "BRANCH", "value": "benchmark-base"},
+                    "cloneFrom": {"codeForge": "GITHUB", "owner": "benchmarks", "repo": "frozen-api"},
+                    "expectedSha": sha, "preserveOrigin": true,
                 }],
-                "setupCommands": [], "sessionSharingAcls": [],
-                "skipInitialTurn": false, "snapshotDisabled": false,
+                "setupCommands": ["prepare-workspace"], "sessionSharingAcls": [],
+                "skipInitialTurn": true, "snapshotDisabled": true,
             }))
             .unwrap();
             let (options, _, _, _) = app.update(|ctx| {
                 super::build_execution_task_and_options(
-                    &args,
+                    Some(&args),
                     config,
-                    use_factory_repositories,
+                    super::RepositoryContract {
+                        supports_deferred_repositories,
+                        use_factory_repositories: false,
+                    },
                     root.path().to_path_buf(),
                     None,
                     Vec::new(),
@@ -109,7 +116,7 @@ fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
                 .unwrap()
             });
             assert_eq!(options.workspace.source_repos.len(), expected_eager_count);
-            assert_eq!(options.use_factory_repositories, use_factory_repositories);
+            assert!(!options.use_factory_repositories);
             if expected_eager_count != 0 {
                 assert_eq!(
                     options.workspace.source_repos,
@@ -120,9 +127,29 @@ fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
                     )]
                 );
             }
-            if use_factory_repositories {
+            if supports_deferred_repositories {
+                let deferred = &options.workspace.deferred_repos[0];
+                assert_eq!(deferred.expected_sha.as_deref(), Some(sha));
                 assert_eq!(
-                    options.workspace.deferred_repos,
+                    deferred.checkout,
+                    Some(RepositoryHeadRef::Branch("benchmark-base".into()))
+                );
+                assert_eq!(
+                    deferred.clone_from,
+                    Some(SourceRepo::new(
+                        CodeForge::GitHub,
+                        "benchmarks".into(),
+                        "frozen-api".into(),
+                    ))
+                );
+                assert!(deferred.preserve_origin);
+                assert_eq!(
+                    options
+                        .workspace
+                        .deferred_repos
+                        .iter()
+                        .map(|repo| repo.source.clone())
+                        .collect::<Vec<_>>(),
                     vec![SourceRepo::new(
                         CodeForge::GitLab,
                         "platform/backend".into(),
@@ -132,28 +159,115 @@ fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
             } else {
                 assert!(options.workspace.deferred_repos.is_empty());
             }
-            assert_eq!(options.workspace.factory_skill_dirs, Some(Vec::new()));
+            assert_eq!(options.workspace.setup_commands, ["prepare-workspace"]);
+            assert_eq!(
+                options.workspace.factory_skill_dirs,
+                Some(vec![".agents/skills".into()])
+            );
+            assert_eq!(options.idle_on_complete, Some(Duration::from_secs(120)));
+            assert_eq!(options.idle_on_fail, Some(Duration::from_secs(60)));
+            assert!(options.skip_initial_turn);
+            assert_eq!(options.snapshot_disabled, Some(true));
         }
     });
 }
 
 #[test]
-fn paired_execution_retains_deferred_capability_through_task_setup() {
-    for scenario in ["eager", "deferred", "empty"] {
+fn factory_repositories_need_a_task_support_and_a_factory_id() {
+    let task_id = || TASK_ID.parse().ok();
+    assert!(super::factory_repository_contract(
+        task_id(),
+        true,
+        Some("factory")
+    ));
+    assert!(!super::factory_repository_contract(
+        task_id(),
+        true,
+        Some("")
+    ));
+    assert!(!super::factory_repository_contract(
+        task_id(),
+        true,
+        None::<&str>
+    ));
+    assert!(!super::factory_repository_contract(
+        task_id(),
+        false,
+        Some("factory")
+    ));
+    assert!(!super::factory_repository_contract(
+        None,
+        true,
+        Some("factory")
+    ));
+}
+
+#[test]
+fn paired_execution_rejects_a_different_task_or_execution() {
+    App::test((), |mut app| async move {
+        let root = tempfile::TempDir::new().unwrap();
+        let args =
+            parse_run_agent_args(&["agent", "run", "--task-id", TASK_ID, "--execution-id", "42"]);
+        for (task_id, execution_id) in [
+            ("00000000-0000-0000-0000-000000000002", "42"),
+            (TASK_ID, "43"),
+        ] {
+            let config = serde_json::from_value(json!({
+                "taskId": task_id, "executionId": execution_id, "harness": "OZ",
+                "conversationId": null, "parentRunId": null, "teamId": null, "modelId": null,
+                "reasoningLevel": null, "profileId": null, "computerUseModelId": null,
+                "inferenceProviders": null, "providers": null,
+                "idleOnCompleteSeconds": null, "idleOnFailSeconds": null,
+                "mcpServersJson": "{}", "skills": [], "factorySkillDirs": [],
+                "computerUseEnabled": false, "repositories": [], "deferredRepositories": [],
+                "setupCommands": [], "sessionSharingAcls": [],
+                "skipInitialTurn": false, "snapshotDisabled": false,
+            }))
+            .unwrap();
+            let result = app.update(|ctx| {
+                super::build_execution_task_and_options(
+                    Some(&args),
+                    config,
+                    super::RepositoryContract {
+                        supports_deferred_repositories: true,
+                        use_factory_repositories: false,
+                    },
+                    root.path().to_owned(),
+                    None,
+                    Vec::new(),
+                    ctx,
+                )
+            });
+            assert!(result.is_err());
+        }
+    });
+}
+
+#[test]
+fn paired_execution_keeps_captured_capability_after_runtime_flag_changes() {
+    for scenario in ["eager", "deferred", "empty", "non-factory", "missing"] {
         let output = ProcessCommand::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "ai::agent_sdk::tests::deferred_capability_bootstrap_subprocess",
                 "--nocapture",
             ])
-            .env("WARP_TEST_DEFERRED_CAPABILITY_SCENARIO", scenario)
+            .env("WARP_TEST_DEFERRED_CAPABILITY_BOOTSTRAP", scenario)
+            .env(
+                "WARP_FACTORY_ID",
+                if scenario == "non-factory" {
+                    ""
+                } else {
+                    "factory"
+                },
+            )
             .env("WARP_ISOLATION_PLATFORM", "docker")
             .env("WARP_WORKLOAD_TOKEN", "test-workload-token")
             .output()
             .unwrap();
         assert!(
             output.status.success(),
-            "{scenario}: {}{}",
+            "{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -162,24 +276,28 @@ fn paired_execution_retains_deferred_capability_through_task_setup() {
 
 #[test]
 fn deferred_capability_bootstrap_subprocess() {
-    let Ok(scenario) = std::env::var("WARP_TEST_DEFERRED_CAPABILITY_SCENARIO") else {
+    let Ok(scenario) = std::env::var("WARP_TEST_DEFERRED_CAPABILITY_BOOTSTRAP") else {
         return;
     };
-    let use_factory_repositories = scenario != "eager";
-    let eager = if use_factory_repositories {
+    let supports_deferred_repositories = scenario != "eager";
+    let use_factory_repositories = supports_deferred_repositories && scenario != "non-factory";
+    let eager = if supports_deferred_repositories {
         json!([])
     } else {
         json!([{
             "forge": "GITLAB", "owner": "platform/backend", "name": "api",
-            "ref": null, "cloneFrom": null, "preserveOrigin": true,
+            "ref": null, "cloneFrom": null, "preserveOrigin": true, "expectedSha": null,
         }])
     };
     let deferred = if scenario == "deferred" {
-        json!([{"codeForge": "GITLAB", "owner": "platform/backend", "repo": "api"}])
+        json!([{
+            "forge": "GITLAB", "owner": "platform/backend", "name": "api",
+            "ref": null, "cloneFrom": null, "expectedSha": null, "preserveOrigin": true
+        }])
     } else {
         json!([])
     };
-    let config = json!({
+    let mut config = json!({
         "taskId": TASK_ID, "executionId": "42", "harness": "OZ",
         "conversationId": null, "parentRunId": null, "teamId": null, "modelId": null,
         "reasoningLevel": null, "profileId": null, "computerUseModelId": null,
@@ -187,10 +305,12 @@ fn deferred_capability_bootstrap_subprocess() {
         "idleOnCompleteSeconds": null, "idleOnFailSeconds": null,
         "mcpServersJson": "{}", "skills": [], "factorySkillDirs": [],
         "computerUseEnabled": false, "repositories": eager,
-        "deferredRepositories": deferred,
         "setupCommands": [], "sessionSharingAcls": [],
         "skipInitialTurn": false, "snapshotDisabled": false,
     });
+    if supports_deferred_repositories && scenario != "missing" {
+        config["deferredRepositories"] = deferred;
+    }
     let mut server = warp_core::channel::ChannelState::mock_server();
     let bootstrap = server
         .mock("POST", "/graphql/v2")
@@ -200,7 +320,7 @@ fn deferred_capability_bootstrap_subprocess() {
         ))
         .match_body(Matcher::PartialJson(json!({"variables": {
             "executionId": "42",
-            "supportsDeferredRepositories": use_factory_repositories,
+            "supportsDeferredRepositories": supports_deferred_repositories,
             "secretsInput": {"taskId": TASK_ID, "workloadToken": "test-workload-token"},
             "taskInput": {"taskId": TASK_ID}
         }})))
@@ -245,8 +365,8 @@ fn deferred_capability_bootstrap_subprocess() {
     App::test((), |mut app| async move {
         let _refresh = FeatureFlag::GitCredentialRefresh.override_enabled(true);
         let _handoff = FeatureFlag::OzHandoff.override_enabled(false);
-        let capability =
-            FeatureFlag::FactoryDeferredRepositories.override_enabled(use_factory_repositories);
+        let _capability = FeatureFlag::FactoryDeferredRepositories
+            .override_enabled(supports_deferred_repositories);
         let provider = app.add_singleton_model(|_| ServerApiProvider::new_for_test());
         let ai_client = provider.read(&app, |provider, _| provider.get_ai_client());
         let runner = app.add_singleton_model(|_| AgentDriverRunner);
@@ -259,16 +379,19 @@ fn deferred_capability_bootstrap_subprocess() {
         let data = AgentDriverRunner::fetch_execution_task_data(&foreground, TASK_ID, "42")
             .await
             .unwrap();
-        assert_eq!(data.use_factory_repositories, use_factory_repositories);
-        drop(capability);
-        let _opposite =
-            FeatureFlag::FactoryDeferredRepositories.override_enabled(!use_factory_repositories);
+        assert_eq!(
+            data.repository_contract.supports_deferred_repositories,
+            supports_deferred_repositories
+        );
+        drop(_capability);
+        let _changed_capability = FeatureFlag::FactoryDeferredRepositories
+            .override_enabled(!supports_deferred_repositories);
         let events = runner.update(&mut app, |_, ctx| {
             super::SetupClientEventReporter::noop(ai_client.clone(), ctx.background_executor())
         });
         let args =
             parse_run_agent_args(&["agent", "run", "--task-id", TASK_ID, "--execution-id", "42"]);
-        let (options, _, _) = AgentDriverRunner::build_driver_options_and_task(
+        let result = AgentDriverRunner::build_driver_options_and_task(
             &foreground,
             args,
             None,
@@ -276,12 +399,25 @@ fn deferred_capability_bootstrap_subprocess() {
             &events,
             Some(data),
         )
-        .await
-        .unwrap();
+        .await;
+        if scenario == "missing" {
+            let error = result
+                .err()
+                .expect("enabled bootstrap requires deferred inventory");
+            let AgentDriverError::ConfigBuildFailed(source) = error else {
+                panic!("unexpected bootstrap error: {error:?}");
+            };
+            assert_eq!(
+                source.to_string(),
+                "Execution configuration is missing deferred repositories"
+            );
+            return;
+        }
+        let (options, _, _) = result.unwrap();
         assert_eq!(options.use_factory_repositories, use_factory_repositories);
         assert_eq!(
             options.workspace.source_repos.len(),
-            usize::from(scenario == "eager")
+            usize::from(!supports_deferred_repositories)
         );
         assert_eq!(
             options.workspace.deferred_repos.len(),
@@ -519,6 +655,7 @@ pub(crate) fn agent_driver_options() -> AgentDriverOptions {
         idle_on_complete: None,
         idle_on_fail: None,
         secrets: Default::default(),
+        environment_variables: Default::default(),
         resume: None,
         cloud_providers: vec![],
         workspace: WorkspaceConfiguration::default(),

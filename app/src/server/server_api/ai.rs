@@ -798,8 +798,8 @@ pub struct CreateFileArtifactUploadResponse {
     pub upload_target: FileArtifactUploadTargetInfo,
 }
 
-/// A single git credential entry returned by `taskGitCredentials`.
-#[derive(Clone)]
+/// Credentials for one managed Git host.
+#[derive(Clone, serde::Deserialize)]
 pub struct GitCredential {
     /// The provider's OAuth or installation access token.
     pub token: String,
@@ -1008,8 +1008,10 @@ impl<'de> serde::Deserialize<'de> for ListRunsResponse {
     where
         D: serde::Deserializer<'de>,
     {
+        #[serde_with::serde_as]
         #[derive(serde::Deserialize)]
         struct RawResponse {
+            #[serde_as(deserialize_as = "serde_with::DefaultOnNull")]
             runs: Vec<serde_json::Value>,
         }
 
@@ -1765,7 +1767,7 @@ impl ServerApi {
         workload_token: String,
         supports_deferred_repositories: bool,
     ) -> anyhow::Result<ExecutionBootstrapData> {
-        let operation = ExecutionBootstrap::build(ExecutionBootstrapVariables {
+        let operation = ExecutionBootstrap::build_with_capabilities(ExecutionBootstrapVariables {
             execution_id: execution_id.to_string().into(),
             supports_deferred_repositories,
             secrets_input: TaskSecretsInput {
@@ -1776,7 +1778,7 @@ impl ServerApi {
                 task_id: task_id.to_string().into(),
             },
             request_context: get_request_context(),
-        });
+        })?;
         let response = self.send_graphql_request(operation, None).await?;
         let (config, attachments) = match response.task {
             BootstrapTaskResult::TaskOutput(output) => (
@@ -1958,7 +1960,7 @@ impl ServerApi {
     }
 }
 
-fn into_git_credential(
+pub(super) fn into_git_credential(
     credential: warp_graphql::queries::task_git_credentials::TaskGitCredential,
 ) -> GitCredential {
     GitCredential {

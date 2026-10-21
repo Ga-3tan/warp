@@ -777,22 +777,22 @@ pub enum ChatGPTSubscriptionErrorActionKind {
     ContinueWithWarpCredits,
     /// Open an external page in the browser without changing the conversation.
     OpenUrl { url: String },
+    /// Copy server-authored text without retrying or changing conversation funding.
+    CopyText { text: String },
 }
 
-impl TryFrom<warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::action::Kind>
+impl From<warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::action::Kind>
     for ChatGPTSubscriptionErrorActionKind
 {
-    type Error = ();
-
-    fn try_from(
+    fn from(
         kind: warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::action::Kind,
-    ) -> Result<Self, Self::Error> {
+    ) -> Self {
         use warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::action::Kind;
         match kind {
-            Kind::Retry(_) => Ok(Self::Retry),
-            Kind::ContinueWithWarpCredits(_) => Ok(Self::ContinueWithWarpCredits),
-            Kind::OpenUrl(open_url) => Ok(Self::OpenUrl { url: open_url.url }),
-            Kind::CopyText(_) => Err(()),
+            Kind::Retry(_) => Self::Retry,
+            Kind::ContinueWithWarpCredits(_) => Self::ContinueWithWarpCredits,
+            Kind::OpenUrl(open_url) => Self::OpenUrl { url: open_url.url },
+            Kind::CopyText(copy_text) => Self::CopyText { text: copy_text.text },
         }
     }
 }
@@ -808,7 +808,7 @@ impl RenderableAIError {
             .into_iter()
             .filter_map(|action| {
                 Some(ChatGPTSubscriptionErrorAction {
-                    kind: action.kind?.try_into().ok()?,
+                    kind: action.kind?.into(),
                     label: action.label,
                 })
             })
@@ -1022,8 +1022,15 @@ impl Display for RenderableAIError {
             } => {
                 write!(f, "{title}\n\n{message}")?;
                 for action in actions {
-                    if let ChatGPTSubscriptionErrorActionKind::OpenUrl { url } = &action.kind {
-                        write!(f, "\n\n{}: {url}", action.label)?;
+                    match &action.kind {
+                        ChatGPTSubscriptionErrorActionKind::OpenUrl { url } => {
+                            write!(f, "\n\n{}: {url}", action.label)?;
+                        }
+                        ChatGPTSubscriptionErrorActionKind::CopyText { text } => {
+                            write!(f, "\n\n{}:\n{text}", action.label)?;
+                        }
+                        ChatGPTSubscriptionErrorActionKind::Retry
+                        | ChatGPTSubscriptionErrorActionKind::ContinueWithWarpCredits => {}
                     }
                 }
                 Ok(())

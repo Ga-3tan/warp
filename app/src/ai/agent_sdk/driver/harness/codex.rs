@@ -37,7 +37,8 @@ use super::transcript_persistence::{
 };
 use super::usage_reporting::CaptureIdentity;
 use super::{
-    HarnessRunner, JSONMCPServer, ResumePayload, SavePoint, ThirdPartyHarness, write_temp_file,
+    HarnessRunner, JSONMCPServer, ResumePayload, SavePoint, ThirdPartyHarness, install_docs_url,
+    write_temp_file,
 };
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent_sdk::setup_observability::{SetupClientEventReporter, SetupStep};
@@ -72,7 +73,7 @@ impl ThirdPartyHarness for CodexHarness {
     }
 
     fn install_docs_url(&self) -> Option<&'static str> {
-        Some("https://developers.openai.com/codex/cli")
+        install_docs_url(self.harness())
     }
 
     fn auth_check_command(&self) -> Option<String> {
@@ -138,7 +139,7 @@ impl ThirdPartyHarness for CodexHarness {
         resume: Option<ResumePayload>,
         resolved_env_vars: &HashMap<OsString, OsString>,
         skill_dirs: &[PathBuf],
-        has_deferred_repositories: bool,
+        factory_repository_contract: bool,
         resolved_secrets: &HashMap<String, ManagedSecretValue>,
         resolved_mcp_servers: &HashMap<String, JSONMCPServer>,
         third_party_harness_model_config: Option<&HarnessModelConfig>,
@@ -160,7 +161,7 @@ impl ThirdPartyHarness for CodexHarness {
             workspace_root,
             harness_working_dir,
             skill_dirs,
-            has_deferred_repositories,
+            factory_repository_contract,
             HarnessSupportSkills::Plugin,
         )
         .map_err(|error| AgentDriverError::HarnessConfigSetupFailed {
@@ -646,7 +647,7 @@ pub(super) fn publish_skills_for_codex(
     workspace_root: &Path,
     harness_working_dir: &Path,
     skill_dirs: &[PathBuf],
-    has_deferred_repositories: bool,
+    factory_repository_contract: bool,
     harness_support_skills: HarnessSupportSkills,
 ) -> Result<()> {
     let skill_root = harness_working_dir.join(".agents").join("skills");
@@ -656,7 +657,7 @@ pub(super) fn publish_skills_for_codex(
         workspace_root,
         is_sandbox,
         skill_dirs,
-        has_deferred_repositories,
+        factory_repository_contract,
         harness_support_skills,
     )?;
     super::skill_dirs_publish::exclude_published_skill_paths_from_git(

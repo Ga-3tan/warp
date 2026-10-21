@@ -136,7 +136,7 @@ fn chatgpt_subscription_error_maps_known_actions_and_drops_unknown_kinds() {
     use warp_multi_agent_api::response_event::stream_finished::ChatGptSubscriptionError;
     use warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::{
         Action,
-        action::{ContinueWithWarpCredits, CopyText, Kind, Retry},
+        action::{ContinueWithWarpCredits, Kind, Retry},
     };
 
     let error = RenderableAIError::from_chatgpt_subscription_error(ChatGptSubscriptionError {
@@ -152,12 +152,6 @@ fn chatgpt_subscription_error_maps_known_actions_and_drops_unknown_kinds() {
             Action {
                 label: "From a newer server".to_string(),
                 kind: None,
-            },
-            Action {
-                label: "Unsupported copy action".to_string(),
-                kind: Some(Kind::CopyText(CopyText {
-                    text: "diagnostic".to_string(),
-                })),
             },
             Action {
                 label: "Continue with Warp credits".to_string(),
@@ -195,6 +189,47 @@ fn chatgpt_subscription_error_maps_known_actions_and_drops_unknown_kinds() {
     assert_eq!(
         error.to_string(),
         "ChatGPT couldn't verify your subscription usage\n\nTry again, or continue with Warp credits."
+    );
+}
+
+#[test]
+fn chatgpt_subscription_error_preserves_copy_text_in_action_and_plain_text() {
+    use warp_multi_agent_api::response_event::stream_finished::ChatGptSubscriptionError;
+    use warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::{
+        Action,
+        action::{CopyText, Kind},
+    };
+
+    let request = "Ask the admin at admin.openai.com -> Workspace -> Usage limits.\nThank you!";
+    let error = RenderableAIError::from_chatgpt_subscription_error(ChatGptSubscriptionError {
+        code: "subscription_sharing_workplace_individual_usage_limit_exceeded".to_string(),
+        title: "Workspace usage limit".to_string(),
+        message: "Ask your workspace admin for increased limits.".to_string(),
+        actions: vec![Action {
+            label: "Copy request for admin".to_string(),
+            kind: Some(Kind::CopyText(CopyText {
+                text: request.to_string(),
+            })),
+        }],
+    });
+
+    let RenderableAIError::ChatGPTSubscriptionError { actions, .. } = &error else {
+        panic!("expected a ChatGPT subscription error, got {error:?}");
+    };
+    assert_eq!(
+        actions,
+        &[ChatGPTSubscriptionErrorAction {
+            label: "Copy request for admin".to_string(),
+            kind: ChatGPTSubscriptionErrorActionKind::CopyText {
+                text: request.to_string(),
+            },
+        }]
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Workspace usage limit\n\nAsk your workspace admin for increased limits.\n\nCopy request for admin:\n{request}"
+        )
     );
 }
 

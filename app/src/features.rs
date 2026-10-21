@@ -539,6 +539,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::StoredScreenshots,
         #[cfg(feature = "cloud_agent_shell_respawn")]
         FeatureFlag::CloudAgentShellRespawn,
+        #[cfg(feature = "acp_harness")]
+        FeatureFlag::AcpHarness,
     ]);
 
     flags
