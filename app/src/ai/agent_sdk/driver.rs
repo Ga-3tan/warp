@@ -2375,7 +2375,7 @@ impl AgentDriver {
                 )
                 .await?;
 
-                Self::restore_local_child_owners(&foreground).await?;
+                Self::prepare_local_subtree(&foreground).await?;
                 let status_rx = foreground
                     .spawn(move |me, ctx| me.execute_run(task.prompt, ctx))
                     .await?;

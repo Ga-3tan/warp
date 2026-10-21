@@ -1,18 +1,18 @@
 use super::*;
-use crate::ai::ambient_agents::discovery::{
-    discover_local_child_subtree, needs_restored_local_owner,
+use crate::ai::ambient_agents::discovery::{is_native_local_run, list_local_subtree};
+use crate::ai::blocklist::orchestration_event_streamer::{
+    LocalChildRestorationTarget, OrchestrationEventStreamer,
 };
-use crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer;
 use crate::server::retry_strategies::is_transient_http_error;
 
 impl AgentDriver {
-    pub(super) async fn restore_local_child_owners(
+    pub(super) async fn prepare_local_subtree(
         foreground: &ModelSpawner<Self>,
     ) -> Result<(), AgentDriverError> {
         let Some((parent_id, parent_conversation_id, terminal_id, group, client, env, working_dir)) =
             foreground
                 .spawn(|me, ctx| {
-                    if !FeatureFlag::RestoreLocalChildOwners.is_enabled() {
+                    if !FeatureFlag::RestoreLocalSubtree.is_enabled() {
                         return None;
                     }
                     let parent_id = me.task_id?;
@@ -33,16 +33,17 @@ impl AgentDriver {
             foreground
                 .spawn(|me, ctx| {
                     if let Some(group) = me.terminal_driver.as_ref(ctx).pane_group().cloned() {
-                        group.update(ctx, |group, ctx| group.release_headless_child_seed(ctx));
+                        group.update(ctx, |group, ctx| group.release_passive_child_seeding(ctx));
                     }
                 })
                 .await?;
             return Ok(());
         };
         let group = group.ok_or(AgentDriverError::TerminalUnavailable)?;
+        let pane_group_id = group.id();
         let mut attempt = 0;
         let batches = loop {
-            match discover_local_child_subtree(client.as_ref(), parent_id).await {
+            match list_local_subtree(client.as_ref(), parent_id).await {
                 Ok(batches) => break batches,
                 Err(error) if is_transient_http_error(&error) && attempt < 4 => {
                     attempt += 1;
@@ -59,14 +60,14 @@ impl AgentDriver {
             }
         };
         let mut conversations = HashMap::from([(parent_id, parent_conversation_id)]);
-        let mut restored_children = Vec::new();
+        let mut local_descendant_conversation_ids = Vec::new();
         for batch in batches {
             let parent_id = batch.parent_task_id;
             let parent_conversation_id = conversations[&parent_id];
             for task in batch
                 .children
                 .iter()
-                .filter(|task| needs_restored_local_owner(task))
+                .filter(|task| is_native_local_run(task))
             {
                 let task = task.clone();
                 let task_id = task.task_id;
@@ -81,7 +82,7 @@ impl AgentDriver {
                             Harness::Oz,
                         ));
                         group.update(ctx, |group, ctx| {
-                            group.prepare_restored_child(
+                            group.prepare_restored_local_child(
                                 parent_conversation_id,
                                 terminal_id,
                                 &task,
@@ -92,7 +93,7 @@ impl AgentDriver {
                     })
                     .await?;
                 conversations.insert(task_id, child_id);
-                restored_children.push(child_id);
+                local_descendant_conversation_ids.push(child_id);
                 let result = match terminal {
                     Ok(None) => continue,
                     Ok(Some(terminal)) => {
@@ -149,10 +150,15 @@ impl AgentDriver {
                     .spawn(move |_, ctx| {
                         OrchestrationEventStreamer::handle(ctx).update(ctx, |streamer, ctx| {
                             match result {
-                                Ok(terminal) => {
-                                    streamer.register_restored_child(child_id, &terminal, ctx)
-                                }
-                                Err(error) => streamer.fail_restored_child(
+                                Ok(terminal) => streamer.register_restored_local_child(
+                                    child_id,
+                                    LocalChildRestorationTarget {
+                                        pane_group_id,
+                                        terminal_id: terminal.id(),
+                                    },
+                                    ctx,
+                                ),
+                                Err(error) => streamer.fail_local_child_restoration(
                                     child_id,
                                     format!("{error:#}"),
                                     ctx,
@@ -176,7 +182,7 @@ impl AgentDriver {
                             }
                         });
                         group.update(ctx, |group, ctx| {
-                            group.finish_restored_child_owners(
+                            group.seed_passive_children(
                                 parent_conversation_id,
                                 terminal_id,
                                 &batch.children,
@@ -190,9 +196,9 @@ impl AgentDriver {
         foreground
             .spawn(move |_, ctx| {
                 OrchestrationEventStreamer::handle(ctx).update(ctx, |streamer, ctx| {
-                    streamer.release_restored_child_subtree(&restored_children, ctx);
+                    streamer.release_local_subtree_startup(&local_descendant_conversation_ids, ctx);
                 });
-                group.update(ctx, |group, ctx| group.release_headless_child_seed(ctx));
+                group.update(ctx, |group, ctx| group.release_passive_child_seeding(ctx));
             })
             .await?;
         Ok(())

@@ -14,7 +14,7 @@ use super::history_model::{
     BlocklistAIHistoryEvent, BlocklistAIHistoryModel, ConversationStatusUpdate,
 };
 use crate::ai::agent::conversation::{
-    AIConversation, AIConversationId, ConversationStatus, RestoredChildHydration,
+    AIConversation, AIConversationId, ConversationStatus, LocalChildRestorationStatus,
 };
 use crate::ai::agent::{AIAgentOutputStatus, FinishedAIAgentOutput, RenderableAIError};
 use crate::ai::ambient_agents::AmbientAgentTaskId;
@@ -310,8 +310,8 @@ impl LocalAgentTaskSyncModel {
         let Some((task_id, Some(update))) =
             with_local_conversation(conversation_id, ctx, |conversation| {
                 if conversation
-                    .restored_child_hydration()
-                    .is_some_and(|state| state != RestoredChildHydration::Ready)
+                    .local_child_restoration_status()
+                    .is_some_and(|state| state != LocalChildRestorationStatus::Restored)
                 {
                     return None;
                 }

@@ -3,24 +3,100 @@ use std::ffi::OsString;
 
 use anyhow::Context as _;
 use warp_cli::agent::Harness;
-use warpui::{EntityId, SingletonEntity, ViewContext, ViewHandle};
+use warpui::{EntityId, ModelHandle, SingletonEntity, ViewContext, ViewHandle};
 
-use crate::ai::agent::conversation::{AIConversation, AIConversationId, RestoredChildHydration};
-use crate::ai::ambient_agents::discovery::needs_restored_local_owner;
+use crate::ai::agent::conversation::{
+    AIConversation, AIConversationId, LocalChildRestorationStatus,
+};
+use crate::ai::ambient_agents::discovery::is_native_local_run;
 use crate::ai::ambient_agents::task::AmbientAgentTask;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
-use crate::ai::blocklist::orchestration_event_streamer::agent_task_harness;
+use crate::ai::blocklist::orchestration_event_streamer::{
+    LocalChildHistoryInstallation, OrchestrationEventStreamer, agent_task_harness,
+};
 use crate::pane_group::PaneGroup;
 use crate::terminal::TerminalView;
+use crate::terminal::view::load_ai_conversation::{
+    RestoreConversationEntryBehavior, RestoredAIConversation,
+};
 
 impl PaneGroup {
+    pub(in crate::pane_group) fn install_local_child_history(
+        &mut self,
+        streamer: &ModelHandle<OrchestrationEventStreamer>,
+        installation: LocalChildHistoryInstallation,
+        prepared: &AIConversation,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if installation.target.pane_group_id != ctx.view_id()
+            || !streamer.update(ctx, |streamer, ctx| {
+                streamer.begin_local_child_history_installation(installation, ctx)
+            })
+        {
+            return;
+        }
+        let result = (|| {
+            let child_id = installation.conversation_id;
+            anyhow::ensure!(prepared.id() == child_id, "conversation identity changed");
+            let pane = self
+                .child_agent_panes
+                .get(&child_id)
+                .copied()
+                .context("canonical child pane missing")?;
+            anyhow::ensure!(
+                self.has_pane_id(pane) && !self.is_pane_hidden_for_close(pane),
+                "canonical child pane closed"
+            );
+            anyhow::ensure!(
+                self.pane_id_for_owned_conversation(child_id, ctx) == Some(pane),
+                "canonical child pane replaced"
+            );
+            let terminal = self
+                .terminal_view_from_pane_id(pane, ctx)
+                .context("owner terminal missing")?;
+            anyhow::ensure!(
+                terminal.id() == installation.target.terminal_id
+                    && terminal.as_ref(ctx).active_conversation_id(ctx) == Some(child_id),
+                "owner terminal binding changed"
+            );
+            let current = BlocklistAIHistoryModel::as_ref(ctx)
+                .conversation(&child_id)
+                .context("conversation missing")?;
+            anyhow::ensure!(
+                current.driver().owns_turn_lifecycle()
+                    && current.local_child_restoration_status()
+                        == Some(LocalChildRestorationStatus::Restoring),
+                "execution conversation replaced"
+            );
+            let mut conversation = prepared.clone();
+            conversation.preserve_local_subtree_startup(current);
+            conversation.set_local_child_restoration_status(LocalChildRestorationStatus::Restoring);
+            terminal.update(ctx, |terminal, ctx| {
+                terminal.restore_conversation_after_view_creation(
+                    RestoredAIConversation::new(conversation),
+                    true,
+                    RestoreConversationEntryBehavior::PreserveAgentViewState,
+                    ctx,
+                );
+            });
+            anyhow::ensure!(
+                self.pane_id_for_owned_conversation(child_id, ctx) == Some(pane)
+                    && terminal.as_ref(ctx).active_conversation_id(ctx) == Some(child_id),
+                "owner terminal changed during installation"
+            );
+            Ok(())
+        })();
+        streamer.update(ctx, |streamer, ctx| {
+            streamer.acknowledge_local_child_history_installation(installation, result, ctx);
+        });
+    }
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    pub(crate) fn release_headless_child_seed(&mut self, ctx: &mut ViewContext<Self>) {
-        self.headless_child_owners_ready = true;
+    pub(crate) fn release_passive_child_seeding(&mut self, ctx: &mut ViewContext<Self>) {
+        self.passive_child_seeding_released = true;
         self.process_pending_parent_child_seeds(ctx);
     }
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    pub(crate) fn prepare_restored_child(
+    pub(crate) fn prepare_restored_local_child(
         &mut self,
         parent_conversation_id: AIConversationId,
         parent_terminal_id: EntityId,
@@ -38,14 +114,20 @@ impl PaneGroup {
         let existing = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation_id_for_agent_id(&task.task_id.to_string());
         let child_id = existing
-            .or_else(|| self.restored_child_owners.get(&task.task_id).copied())
+            .or_else(|| {
+                self.restored_local_descendant_conversations
+                    .get(&task.task_id)
+                    .copied()
+            })
             .unwrap_or_else(AIConversationId::new);
-        self.restored_child_owners.insert(task.task_id, child_id);
+        self.restored_local_descendant_conversations
+            .insert(task.task_id, child_id);
         let result = (|| {
             if BlocklistAIHistoryModel::as_ref(ctx)
                 .conversation(&child_id)
                 .is_some_and(|child| {
-                    child.restored_child_hydration() == Some(RestoredChildHydration::Error)
+                    child.local_child_restoration_status()
+                        == Some(LocalChildRestorationStatus::Error)
                 })
             {
                 return Ok(None);
@@ -63,7 +145,7 @@ impl PaneGroup {
             if self.child_agent_panes.contains_key(&child_id) {
                 self.discard_child_agent_pane_for_conversation(child_id, ctx);
             }
-            let mut child = AIConversation::new_restored_child(child_id);
+            let mut child = AIConversation::new_local_child_for_restoration(child_id);
             child.set_task_id(task.task_id);
             child.set_parent_conversation_id(parent_conversation_id);
             if let Some(parent_run) = BlocklistAIHistoryModel::as_ref(ctx)
@@ -106,7 +188,7 @@ impl PaneGroup {
     }
 
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    pub(crate) fn finish_restored_child_owners(
+    pub(crate) fn seed_passive_children(
         &mut self,
         parent_conversation_id: AIConversationId,
         parent_terminal_id: EntityId,
@@ -118,7 +200,7 @@ impl PaneGroup {
             .and_then(|pane| self.terminal_view_from_pane_id(pane, ctx))
             .map_or(parent_terminal_id, |terminal| terminal.id());
         for task in children {
-            if needs_restored_local_owner(task) {
+            if is_native_local_run(task) {
                 continue;
             }
             BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {

@@ -6,18 +6,18 @@ use super::{AmbientAgentTask, AmbientAgentTaskId, ExecutionLocation};
 use crate::server::server_api::ai::{AIClient, RunSortBy, RunSortOrder, TaskListFilter};
 
 /// Returns all direct children, or an error without exposing a partial traversal.
-pub async fn discover_direct_children(
+pub async fn list_direct_children(
     ai_client: &dyn AIClient,
     parent_task_id: AmbientAgentTaskId,
 ) -> anyhow::Result<Vec<AmbientAgentTask>> {
-    Ok(discover_children_with_harness(ai_client, parent_task_id)
+    Ok(list_direct_children_with_harness(ai_client, parent_task_id)
         .await?
         .into_iter()
         .map(|(task, _)| task)
         .collect())
 }
 
-pub(crate) fn needs_restored_local_owner(task: &AmbientAgentTask) -> bool {
+pub(crate) fn is_native_local_run(task: &AmbientAgentTask) -> bool {
     task.execution_location == Some(ExecutionLocation::Local) && !task.is_third_party_harness()
 }
 
@@ -28,7 +28,7 @@ pub(crate) struct ChildRunBatch {
 }
 
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
-pub(crate) async fn discover_local_child_subtree(
+pub(crate) async fn list_local_subtree(
     ai_client: &dyn AIClient,
     root_task_id: AmbientAgentTaskId,
 ) -> anyhow::Result<Vec<ChildRunBatch>> {
@@ -36,7 +36,7 @@ pub(crate) async fn discover_local_child_subtree(
     let mut identities = HashMap::new();
     let mut batches = Vec::new();
     while let Some(parent_task_id) = parents.pop_front() {
-        let rows = discover_children_with_harness(ai_client, parent_task_id).await?;
+        let rows = list_direct_children_with_harness(ai_client, parent_task_id).await?;
         let mut children = Vec::new();
         for (child, harness) in rows {
             anyhow::ensure!(
@@ -57,7 +57,7 @@ pub(crate) async fn discover_local_child_subtree(
                 continue;
             }
             identities.insert(child.task_id, identity);
-            if needs_restored_local_owner(&child) {
+            if is_native_local_run(&child) {
                 parents.push_back(child.task_id);
             }
             children.push(child);
@@ -70,7 +70,7 @@ pub(crate) async fn discover_local_child_subtree(
     Ok(batches)
 }
 
-async fn discover_children_with_harness(
+async fn list_direct_children_with_harness(
     ai_client: &dyn AIClient,
     parent_task_id: AmbientAgentTaskId,
 ) -> anyhow::Result<Vec<(AmbientAgentTask, Option<String>)>> {

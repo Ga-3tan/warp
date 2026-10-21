@@ -52,156 +52,6 @@ fn sse_backoff_escalates_then_caps() {
 }
 
 #[test]
-fn restored_local_child_subtree_startup_gate() {
-    use crate::ai::agent::conversation::RestoredChildHydration;
-    use crate::test_util::terminal::{add_window_with_terminal, initialize_app_for_terminal_view};
-
-    App::test((), |mut app| async move {
-        initialize_app_for_terminal_view(&mut app);
-        let terminal = add_window_with_terminal(&mut app, None);
-        let child_id = AIConversationId::new();
-        let parent_id = AIConversationId::new();
-        let child_task_id = make_parent_task_id_for_test(0xe9);
-        let parent_task_id = make_parent_task_id_for_test(0xe8);
-        let _task = warp_core::channel::ChannelState::mock_server()
-            .mock(
-                "GET",
-                format!("/api/v1/agent/runs/{child_task_id}").as_str(),
-            )
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                serde_json::to_string(&make_ambient_task_with_task_id(child_task_id, Some(23)))
-                    .unwrap(),
-            )
-            .create();
-        let mut child = AIConversation::new_restored_child(child_id);
-        child.set_task_id(child_task_id);
-        child.set_parent_agent_id(parent_task_id.to_string());
-        child.set_parent_conversation_id(parent_id);
-        child.set_server_conversation_token("server-token".into());
-        child.set_last_event_sequence(23);
-        BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
-            history.restore_conversations(terminal.id(), vec![child], ctx);
-        });
-        let mut client = MockAIClient::new();
-        client
-            .expect_get_ai_conversation()
-            .times(1)
-            .returning(move |_| {
-                let mut metadata = make_server_metadata_with_harness(AIAgentHarness::Oz);
-                metadata.ambient_agent_task_id = Some(child_task_id);
-                Ok((
-                    api::ConversationData {
-                        tasks: vec![api::Task {
-                            id: "root".into(),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                    metadata,
-                ))
-            });
-        let server_api = ServerApiProvider::new_for_test().get();
-        let streamer = app.add_model(|ctx| {
-            OrchestrationEventStreamer::new_with_clients_for_test(Arc::new(client), server_api, ctx)
-        });
-        streamer.update(&mut app, |streamer, ctx| {
-            streamer.register_restored_child(child_id, &terminal, ctx);
-            assert!(streamer.streams[&child_id].wake_connection.is_some());
-            assert!(streamer.streams[&child_id].sse_connection.is_none());
-            assert!(streamer.hydrate_restored_child(child_id, ctx));
-            assert!(streamer.hydrate_restored_child(child_id, ctx));
-            assert!(streamer.streams[&child_id].wake_connection.is_none());
-            assert!(!streamer.is_eligible(child_id, ctx));
-        });
-        crate::test_util::assert_eventually!(
-            streamer.read(&app, |streamer, ctx| streamer
-                .restored_child_state(child_id, ctx)
-                == Some(RestoredChildHydration::Ready)),
-            "hydration did not install the transcript"
-        );
-        streamer.read(&app, |streamer, ctx| {
-            let history = BlocklistAIHistoryModel::as_ref(ctx);
-            let child = history.conversation(&child_id).unwrap();
-            assert_eq!(child.task_id(), Some(child_task_id));
-            assert_eq!(
-                child.parent_agent_id(),
-                Some(parent_task_id.to_string().as_str())
-            );
-            assert_eq!(child.parent_conversation_id(), Some(parent_id));
-            assert_eq!(
-                child.server_conversation_token().unwrap().as_str(),
-                "server-token"
-            );
-            assert_eq!(child.last_event_sequence(), Some(23));
-            assert_eq!(child.status(), &ConversationStatus::Success);
-            assert_eq!(
-                history.terminal_surface_id_for_conversation(&child_id),
-                Some(terminal.id())
-            );
-            assert_eq!(streamer.streams[&child_id].event_cursor, 23);
-            assert!(streamer.streams[&child_id].sse_connection.is_none());
-            assert!(!child.restored_child_execution_ready());
-        });
-        let grandchild_terminal = add_window_with_terminal(&mut app, None);
-        let grandchild_id = AIConversationId::new();
-        let mut grandchild = AIConversation::new_restored_child(grandchild_id);
-        grandchild.set_task_id(make_parent_task_id_for_test(0xea));
-        grandchild.set_parent_agent_id(child_task_id.to_string());
-        grandchild.set_parent_conversation_id(child_id);
-        grandchild.set_server_conversation_token("grandchild-token".into());
-        BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
-            history.restore_conversations(grandchild_terminal.id(), vec![grandchild], ctx);
-        });
-        OrchestrationEventService::handle(&app).update(&mut app, |service, ctx| {
-            service.enqueue_event_batch(
-                child_id,
-                build_pending_events(
-                    vec![ReceivedMessageInput {
-                        message_id: "pending-during-startup".into(),
-                        sender_agent_id: parent_task_id.to_string(),
-                        addresses: vec![child_task_id.to_string()],
-                        subject: "work".into(),
-                        message_body: "continue".into(),
-                    }],
-                    vec![],
-                ),
-                ctx,
-            );
-        });
-        terminal.read(&app, |terminal, ctx| {
-            assert!(
-                !terminal
-                    .ai_controller()
-                    .as_ref(ctx)
-                    .has_active_stream_for_conversation(child_id, ctx)
-            );
-        });
-        streamer.update(&mut app, |streamer, ctx| {
-            streamer.register_restored_child(grandchild_id, &grandchild_terminal, ctx);
-            assert!(streamer.streams[&grandchild_id].wake_connection.is_some());
-            streamer.release_restored_child_subtree(&[child_id, grandchild_id], ctx);
-        });
-        crate::test_util::assert_eventually!(
-            terminal.read(&app, |terminal, ctx| terminal
-                .ai_controller()
-                .as_ref(ctx)
-                .has_active_stream_for_conversation(child_id, ctx)),
-            "startup release did not drain the hydrated child's pending message"
-        );
-        streamer.read(&app, |streamer, ctx| {
-            assert_eq!(
-                streamer.restored_child_state(grandchild_id, ctx),
-                Some(RestoredChildHydration::Unhydrated)
-            );
-            assert!(streamer.streams[&child_id].sse_connection.is_some());
-            assert!(streamer.streams[&grandchild_id].wake_connection.is_some());
-        });
-    });
-}
-
-#[test]
 fn restored_local_child_observer_seed_generation() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -278,7 +128,7 @@ fn restored_local_child_observer_seed_generation() {
 
 #[test]
 fn restored_local_child_transcript_error() {
-    use crate::ai::agent::conversation::RestoredChildHydration;
+    use crate::ai::agent::conversation::LocalChildRestorationStatus;
     for failure in ["fetch/decode", "token", "harness", "conversion"] {
         App::test((), |mut app| async move {
             initialize_settings_for_tests(&mut app);
@@ -290,7 +140,7 @@ fn restored_local_child_transcript_error() {
                 app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
             let child_id = AIConversationId::new();
             let task_id = make_parent_task_id_for_test(0xf1);
-            let mut child = AIConversation::new_restored_child(child_id);
+            let mut child = AIConversation::new_local_child_for_restoration(child_id);
             child.set_task_id(task_id);
             child.set_parent_agent_id(make_parent_task_id_for_test(0xf0).to_string());
             child.set_parent_conversation_id(AIConversationId::new());
@@ -345,12 +195,12 @@ fn restored_local_child_transcript_error() {
             });
             streamer.update(&mut app, |streamer, ctx| {
                 assert!(!streamer.is_eligible(child_id, ctx));
-                assert!(streamer.hydrate_restored_child(child_id, ctx));
-                assert!(streamer.hydrate_restored_child(child_id, ctx));
-                assert!(streamer.hydrate_restored_child(child_id, ctx));
+                assert!(streamer.restore_local_child(child_id, ctx));
+                assert!(streamer.restore_local_child(child_id, ctx));
+                assert!(streamer.restore_local_child(child_id, ctx));
                 assert_eq!(
-                    streamer.restored_child_state(child_id, ctx),
-                    Some(RestoredChildHydration::Hydrating)
+                    streamer.local_child_restoration_status(child_id, ctx),
+                    Some(LocalChildRestorationStatus::Restoring)
                 );
                 assert!(!streamer.is_eligible(child_id, ctx));
             });
@@ -364,7 +214,7 @@ fn restored_local_child_transcript_error() {
                 "hydration failure {failure} did not become Error"
             );
             streamer.update(&mut app, |streamer, ctx| {
-                assert!(streamer.hydrate_restored_child(child_id, ctx));
+                assert!(streamer.restore_local_child(child_id, ctx));
                 assert!(!streamer.is_eligible(child_id, ctx));
                 assert!(
                     streamer
@@ -378,8 +228,8 @@ fn restored_local_child_transcript_error() {
                     .conversation(&child_id)
                     .unwrap();
                 assert_eq!(
-                    child.restored_child_hydration(),
-                    Some(RestoredChildHydration::Error)
+                    child.local_child_restoration_status(),
+                    Some(LocalChildRestorationStatus::Error)
                 );
                 assert_eq!(child.last_event_sequence(), Some(13));
                 assert!(

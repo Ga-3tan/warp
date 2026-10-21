@@ -1983,7 +1983,7 @@ fn restored_local_child_driver_status_isolation() {
         BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
             history.restore_conversations(
                 warpui::EntityId::new(),
-                vec![AIConversation::new_restored_child(child_id)],
+                vec![AIConversation::new_local_child_for_restoration(child_id)],
                 ctx,
             );
             history

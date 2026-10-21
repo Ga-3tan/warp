@@ -440,8 +440,8 @@ pub struct AIConversation {
     /// only matters for the live process that bootstrapped the conversation, and a restored
     /// conversation resumes ordinary synchronization.
     task_sync_mode: TaskSyncMode,
-    restored_child_hydration: Option<RestoredChildHydration>,
-    restored_child_startup_pending: bool,
+    local_child_restoration_status: Option<LocalChildRestorationStatus>,
+    local_subtree_startup_pending: bool,
 
     /// Whether the user chose Warp-funded inference for this conversation after a ChatGPT
     /// token-sharing failure. Sticky for the rest of the conversation and inherited by forks.
@@ -449,11 +449,13 @@ pub struct AIConversation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RestoredChildHydration {
+pub(crate) enum LocalChildRestorationStatus {
+    /// Waits for a message or pane open; history is not fetched in the background.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    Unhydrated,
-    Hydrating,
-    Ready,
+    Pending,
+    Restoring,
+    /// History is installed; local-subtree startup may still block execution.
+    Restored,
     Error,
 }
 
@@ -519,8 +521,8 @@ impl AIConversation {
             pinned: false,
             remote_run_updated_at: None,
             task_sync_mode: TaskSyncMode::default(),
-            restored_child_hydration: None,
-            restored_child_startup_pending: false,
+            local_child_restoration_status: None,
+            local_subtree_startup_pending: false,
             use_warp_credits_instead_of_chatgpt: false,
         }
     }
@@ -780,9 +782,9 @@ impl AIConversation {
             pinned,
             remote_run_updated_at: None,
             task_sync_mode: TaskSyncMode::default(),
-            restored_child_hydration: None,
+            local_child_restoration_status: None,
             use_warp_credits_instead_of_chatgpt,
-            restored_child_startup_pending: false,
+            local_subtree_startup_pending: false,
         })
     }
 
@@ -791,37 +793,40 @@ impl AIConversation {
     }
 
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    pub(crate) fn new_restored_child(id: AIConversationId) -> Self {
+    pub(crate) fn new_local_child_for_restoration(id: AIConversationId) -> Self {
         let mut conversation = Self::new(false, false);
         conversation.id = id;
         conversation.status = ConversationStatus::Success;
-        conversation.restored_child_hydration = Some(RestoredChildHydration::Unhydrated);
-        conversation.restored_child_startup_pending = true;
+        conversation.local_child_restoration_status = Some(LocalChildRestorationStatus::Pending);
+        conversation.local_subtree_startup_pending = true;
         conversation
     }
 
-    pub(crate) fn restored_child_hydration(&self) -> Option<RestoredChildHydration> {
-        self.restored_child_hydration
+    pub(crate) fn local_child_restoration_status(&self) -> Option<LocalChildRestorationStatus> {
+        self.local_child_restoration_status
     }
 
-    pub(crate) fn set_restored_child_hydration(&mut self, state: RestoredChildHydration) {
-        self.restored_child_hydration = Some(state);
+    pub(crate) fn set_local_child_restoration_status(
+        &mut self,
+        state: LocalChildRestorationStatus,
+    ) {
+        self.local_child_restoration_status = Some(state);
     }
 
-    pub(crate) fn restored_child_execution_ready(&self) -> bool {
-        !self.restored_child_startup_pending
+    pub(crate) fn is_local_child_execution_ready(&self) -> bool {
+        !self.local_subtree_startup_pending
             && self
-                .restored_child_hydration
-                .is_none_or(|state| state == RestoredChildHydration::Ready)
+                .local_child_restoration_status
+                .is_none_or(|state| state == LocalChildRestorationStatus::Restored)
     }
 
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    pub(crate) fn release_restored_child_startup(&mut self) {
-        self.restored_child_startup_pending = false;
+    pub(crate) fn release_local_subtree_startup(&mut self) {
+        self.local_subtree_startup_pending = false;
     }
 
-    pub(crate) fn preserve_restored_child_startup(&mut self, current: &Self) {
-        self.restored_child_startup_pending = current.restored_child_startup_pending;
+    pub(crate) fn preserve_local_subtree_startup(&mut self, current: &Self) {
+        self.local_subtree_startup_pending = current.local_subtree_startup_pending;
     }
 
     /// Assigns fresh exchange IDs to all exchanges in this conversation.

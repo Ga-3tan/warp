@@ -780,8 +780,8 @@ pub enum FeatureFlag {
     ///   block snapshot from the server.
     OzHandoff,
 
-    /// Requires persisted worker classification on the server before enabling local-child owners.
-    RestoreLocalChildOwners,
+    /// Restores native-local descendants when a cloud parent resumes after handoff.
+    RestoreLocalSubtree,
 
     /// Enables the upgraded CLI agent session tracking and notifications infrastructure.
     HOANotifications,
@@ -1075,6 +1075,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::PromptCacheExpiryWarning,
     FeatureFlag::JupyterNotebookRendering,
     FeatureFlag::MultiLevelOrchestration,
+    FeatureFlag::RestoreLocalSubtree,
     FeatureFlag::McpJsonTreeView,
     FeatureFlag::BoxDrawingGlyphs,
     FeatureFlag::CtrlCCancelsThirdPartyHarness,

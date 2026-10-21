@@ -20,7 +20,8 @@ use super::orchestration_events::{
     PendingEvent, PendingEventDetail, build_lifecycle_event,
 };
 use crate::ai::agent::conversation::{
-    AIAgentHarness, AIConversationId, ConversationStatus, RestoredChildHydration,
+    AIAgentHarness, AIConversation, AIConversationId, ConversationStatus,
+    LocalChildRestorationStatus,
 };
 use crate::ai::agent::{AIAgentExchangeId, AIAgentOutputMessageType, ReceivedMessageInput};
 use crate::ai::agent_conversations_model::AgentConversationsModel;
@@ -29,7 +30,7 @@ use crate::ai::agent_events::{
     AgentMessageEventMetadata, MessageHydrator, ServerApiAgentEventSource, run_agent_event_driver,
 };
 use crate::ai::ambient_agents::AmbientAgentTaskId;
-use crate::ai::ambient_agents::discovery::discover_direct_children;
+use crate::ai::ambient_agents::discovery::list_direct_children;
 use crate::server::retry_strategies::is_transient_http_error;
 use crate::server::server_api::ai::{AIClient, AgentRunEvent};
 use crate::server::server_api::{ServerApi, ServerApiProvider};
@@ -61,6 +62,19 @@ const EVENT_RUN_SESSION_LINKED: &str = "run_session_linked";
 struct SseStreamItem {
     event: AgentRunEvent,
     fetched_message: Option<ReceivedMessageInput>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalChildRestorationTarget {
+    pub pane_group_id: EntityId,
+    pub terminal_id: EntityId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalChildHistoryInstallation {
+    pub conversation_id: AIConversationId,
+    pub generation: Uuid,
+    pub target: LocalChildRestorationTarget,
 }
 
 /// State for a single active SSE connection.
@@ -189,8 +203,9 @@ impl AgentEventConsumer for SseForwardingConsumer {
 /// removed from the history model.
 #[derive(Default)]
 struct ConversationStreamState {
-    restored_owner: Option<warpui::WeakViewHandle<crate::terminal::TerminalView>>,
-    hydration_generation: Option<Uuid>,
+    local_child_restoration_target: Option<LocalChildRestorationTarget>,
+    local_child_restoration_generation: Option<Uuid>,
+    local_child_history_installation_claimed: bool,
     /// Run IDs the SSE filter watches for this conversation. When the
     /// conversation has any orchestration role, this contains its own
     /// `self_run_id` (its inbox — used both for parent→child traffic on
@@ -303,6 +318,10 @@ pub struct OrchestrationEventStreamer {
 
 #[allow(private_interfaces)]
 pub enum OrchestrationEventStreamerEvent {
+    LocalChildHistoryPrepared {
+        installation: LocalChildHistoryInstallation,
+        conversation: Box<AIConversation>,
+    },
     DormantClaudeWakeReady {
         conversation_id: AIConversationId,
         wake_message: AgentMessageEventMetadata,
@@ -839,8 +858,8 @@ impl OrchestrationEventStreamer {
         ctx: &mut ModelContext<Self>,
     ) {
         if self
-            .restored_child_state(conversation_id, ctx)
-            .is_some_and(|state| state != RestoredChildHydration::Ready)
+            .local_child_restoration_status(conversation_id, ctx)
+            .is_some_and(|state| state != LocalChildRestorationStatus::Restored)
         {
             return;
         }
@@ -1344,7 +1363,7 @@ impl OrchestrationEventStreamer {
         };
         entry.seed_generation = Some(generation);
         ctx.spawn(
-            async move { discover_direct_children(ai_client.as_ref(), parent_task_id).await },
+            async move { list_direct_children(ai_client.as_ref(), parent_task_id).await },
             move |me, result, ctx| {
                 if me
                     .viewer_mode_orchestrators
@@ -1640,7 +1659,10 @@ impl OrchestrationEventStreamer {
         conversation_id: AIConversationId,
         ctx: &mut ModelContext<Self>,
     ) {
-        if self.restored_child_state(conversation_id, ctx).is_some() {
+        if self
+            .local_child_restoration_status(conversation_id, ctx)
+            .is_some()
+        {
             return;
         }
         if self
@@ -1863,7 +1885,7 @@ impl OrchestrationEventStreamer {
         ctx: &mut ModelContext<Self>,
     ) {
         for conv_id in conversation_ids {
-            if self.restored_child_state(conv_id, ctx).is_some() {
+            if self.local_child_restoration_status(conv_id, ctx).is_some() {
                 self.reevaluate_eligibility(conv_id, ctx);
                 continue;
             }
@@ -1952,7 +1974,7 @@ impl OrchestrationEventStreamer {
         run_result: anyhow::Result<crate::ai::ambient_agents::task::AmbientAgentTask>,
         ctx: &mut ModelContext<Self>,
     ) {
-        if self.restored_child_state(conv_id, ctx).is_some() {
+        if self.local_child_restoration_status(conv_id, ctx).is_some() {
             return;
         }
         match run_result {
@@ -2155,7 +2177,7 @@ impl OrchestrationEventStreamer {
     fn is_eligible(&self, conversation_id: AIConversationId, ctx: &warpui::AppContext) -> bool {
         if BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)
-            .is_some_and(|conversation| !conversation.restored_child_execution_ready())
+            .is_some_and(|conversation| !conversation.is_local_child_execution_ready())
         {
             return false;
         }
@@ -2244,7 +2266,7 @@ impl OrchestrationEventStreamer {
         conversation_id: AIConversationId,
         ctx: &mut ModelContext<Self>,
     ) {
-        if self.reevaluate_restored_child(conversation_id, ctx) {
+        if self.reevaluate_local_child_restoration(conversation_id, ctx) {
             return;
         }
         let eligible = self.is_eligible(conversation_id, ctx);

@@ -1,43 +1,57 @@
+use std::time::Duration;
+
 use anyhow::Context as _;
 use warp_errors::report_error;
 use warp_graphql::ai::AgentTaskState;
-use warpui::{AppContext, ViewHandle};
+use warpui::AppContext;
+use warpui::r#async::Timer;
 
 use super::{
     AgentEventDriverConfig, BlocklistAIHistoryModel, DormantClaudeWakeConsumer, Harness,
-    ModelContext, OrchestrationEventStreamer, ServerApiAgentEventSource, SingletonEntity,
-    WakeConnectionState, run_agent_event_driver,
+    LocalChildHistoryInstallation, LocalChildRestorationTarget, ModelContext,
+    OrchestrationEventStreamer, OrchestrationEventStreamerEvent, ServerApiAgentEventSource,
+    SingletonEntity, WakeConnectionState, run_agent_event_driver,
 };
 use crate::ai::agent::RenderableAIError;
 use crate::ai::agent::api::convert_conversation::{
     RestorationMode, convert_conversation_data_to_ai_conversation,
 };
 use crate::ai::agent::conversation::{
-    AIConversation, AIConversationId, ConversationStatus, RestoredChildHydration,
+    AIConversation, AIConversationId, ConversationStatus, LocalChildRestorationStatus,
 };
 use crate::server::server_api::ai::TaskStatusUpdate;
-use crate::terminal::TerminalView;
-use crate::terminal::view::load_ai_conversation::{
-    RestoreConversationEntryBehavior, RestoredAIConversation,
-};
+
+const LOCAL_CHILD_HISTORY_INSTALLATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl OrchestrationEventStreamer {
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    pub(crate) fn register_restored_child(
+    pub(crate) fn register_restored_local_child(
         &mut self,
         conversation_id: AIConversationId,
-        terminal: &ViewHandle<TerminalView>,
+        target: LocalChildRestorationTarget,
         ctx: &mut ModelContext<Self>,
     ) {
-        self.streams
-            .entry(conversation_id)
-            .or_default()
-            .restored_owner = Some(terminal.downgrade());
-        self.register_consumer(conversation_id, terminal.id(), ctx);
+        let stream = self.streams.entry(conversation_id).or_default();
+        let previous = stream.local_child_restoration_target.replace(target);
+        if let Some(previous) = previous.filter(|previous| *previous != target) {
+            stream.consumers.remove(&previous.terminal_id);
+            stream.local_child_restoration_generation = None;
+            stream.local_child_history_installation_claimed = false;
+            if self.local_child_restoration_status(conversation_id, ctx)
+                == Some(LocalChildRestorationStatus::Restoring)
+            {
+                self.fail_local_child_restoration(
+                    conversation_id,
+                    "install transcript: owner replaced".into(),
+                    ctx,
+                );
+            }
+        }
+        self.register_consumer(conversation_id, target.terminal_id, ctx);
     }
 
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    pub(crate) fn release_restored_child_subtree(
+    pub(crate) fn release_local_subtree_startup(
         &mut self,
         conversation_ids: &[AIConversationId],
         ctx: &mut ModelContext<Self>,
@@ -48,10 +62,10 @@ impl OrchestrationEventStreamer {
                 let Some(child) = history.conversation_mut(conversation_id) else {
                     continue;
                 };
-                let was_ready = child.restored_child_execution_ready();
-                child.release_restored_child_startup();
+                let was_ready = child.is_local_child_execution_ready();
+                child.release_local_subtree_startup();
                 if !was_ready
-                    && child.restored_child_execution_ready()
+                    && child.is_local_child_execution_ready()
                     && let Some(surface) = surface
                 {
                     child.update_status_with_error(
@@ -67,34 +81,36 @@ impl OrchestrationEventStreamer {
             self.reevaluate_eligibility(*conversation_id, ctx);
         }
     }
-    pub(crate) fn restored_child_state(
+    pub(crate) fn local_child_restoration_status(
         &self,
         conversation_id: AIConversationId,
         ctx: &AppContext,
-    ) -> Option<RestoredChildHydration> {
+    ) -> Option<LocalChildRestorationStatus> {
         BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)
-            .and_then(AIConversation::restored_child_hydration)
+            .and_then(AIConversation::local_child_restoration_status)
     }
 
-    pub(super) fn reevaluate_restored_child(
+    pub(super) fn reevaluate_local_child_restoration(
         &mut self,
         conversation_id: AIConversationId,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
-        match self.restored_child_state(conversation_id, ctx) {
-            None | Some(RestoredChildHydration::Ready) => false,
-            Some(RestoredChildHydration::Unhydrated) => {
+        match self.local_child_restoration_status(conversation_id, ctx) {
+            None | Some(LocalChildRestorationStatus::Restored) => false,
+            Some(LocalChildRestorationStatus::Pending) => {
                 self.teardown_sse(conversation_id, ctx);
                 let stream = self.streams.entry(conversation_id).or_default();
                 if stream.consumers.is_empty() {
                     self.teardown_dormant_claude_wake_listener(conversation_id);
-                } else if stream.restored_owner.is_some() && stream.wake_connection.is_none() {
-                    self.start_restored_child_wake_listener(conversation_id, ctx);
+                } else if stream.local_child_restoration_target.is_some()
+                    && stream.wake_connection.is_none()
+                {
+                    self.start_local_child_wake_listener(conversation_id, ctx);
                 }
                 true
             }
-            Some(RestoredChildHydration::Hydrating | RestoredChildHydration::Error) => {
+            Some(LocalChildRestorationStatus::Restoring | LocalChildRestorationStatus::Error) => {
                 self.teardown_sse(conversation_id, ctx);
                 self.teardown_dormant_claude_wake_listener(conversation_id);
                 true
@@ -102,7 +118,7 @@ impl OrchestrationEventStreamer {
         }
     }
 
-    fn start_restored_child_wake_listener(
+    fn start_local_child_wake_listener(
         &mut self,
         conversation_id: AIConversationId,
         ctx: &mut ModelContext<Self>,
@@ -147,9 +163,9 @@ impl OrchestrationEventStreamer {
                 }
                 match result {
                     Ok(()) => {
-                        me.hydrate_restored_child(conversation_id, ctx);
+                        me.restore_local_child(conversation_id, ctx);
                     }
-                    Err(error) => me.fail_restored_child(
+                    Err(error) => me.fail_local_child_restoration(
                         conversation_id,
                         format!("wake listener: {error:#}"),
                         ctx,
@@ -163,15 +179,17 @@ impl OrchestrationEventStreamer {
             .wake_connection = Some(WakeConnectionState { generation, task });
     }
 
-    pub(crate) fn hydrate_restored_child(
+    pub(crate) fn restore_local_child(
         &mut self,
         conversation_id: AIConversationId,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
-        match self.restored_child_state(conversation_id, ctx) {
-            None | Some(RestoredChildHydration::Ready) => return false,
-            Some(RestoredChildHydration::Hydrating | RestoredChildHydration::Error) => return true,
-            Some(RestoredChildHydration::Unhydrated) => {}
+        match self.local_child_restoration_status(conversation_id, ctx) {
+            None | Some(LocalChildRestorationStatus::Restored) => return false,
+            Some(LocalChildRestorationStatus::Restoring | LocalChildRestorationStatus::Error) => {
+                return true;
+            }
+            Some(LocalChildRestorationStatus::Pending) => {}
         }
         let Some(stub) = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)
@@ -180,12 +198,17 @@ impl OrchestrationEventStreamer {
             return true;
         };
         let Some(token) = stub.server_conversation_token().cloned() else {
-            self.fail_restored_child(conversation_id, "missing conversation token".into(), ctx);
+            self.fail_local_child_restoration(
+                conversation_id,
+                "missing conversation token".into(),
+                ctx,
+            );
             return true;
         };
         BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
             if let Some(conversation) = history.conversation_mut(&conversation_id) {
-                conversation.set_restored_child_hydration(RestoredChildHydration::Hydrating);
+                conversation
+                    .set_local_child_restoration_status(LocalChildRestorationStatus::Restoring);
             }
         });
         self.reevaluate_eligibility(conversation_id, ctx);
@@ -194,7 +217,11 @@ impl OrchestrationEventStreamer {
         self.streams
             .entry(conversation_id)
             .or_default()
-            .hydration_generation = Some(generation);
+            .local_child_restoration_generation = Some(generation);
+        self.streams
+            .entry(conversation_id)
+            .or_default()
+            .local_child_history_installation_claimed = false;
         ctx.spawn(
             async move {
                 let (data, metadata) = client
@@ -235,75 +262,154 @@ impl OrchestrationEventStreamer {
                 }
                 hydrated.set_orchestration_harness(Harness::Oz);
                 hydrated.set_last_event_sequence(stub.last_event_sequence().unwrap_or(0));
-                hydrated.set_restored_child_hydration(RestoredChildHydration::Hydrating);
+                hydrated.set_local_child_restoration_status(LocalChildRestorationStatus::Restoring);
                 Ok::<_, anyhow::Error>(hydrated)
             },
             move |me, result, ctx| {
-                if me.restored_child_state(conversation_id, ctx)
-                    != Some(RestoredChildHydration::Hydrating)
+                if me.local_child_restoration_status(conversation_id, ctx)
+                    != Some(LocalChildRestorationStatus::Restoring)
                     || me
                         .streams
                         .get(&conversation_id)
-                        .and_then(|stream| stream.hydration_generation)
+                        .and_then(|stream| stream.local_child_restoration_generation)
                         != Some(generation)
                 {
                     return;
                 }
-                let result = result.and_then(|mut hydrated| {
-                    let current = BlocklistAIHistoryModel::as_ref(ctx)
-                        .conversation(&conversation_id)
-                        .context("install transcript: conversation missing")?;
-                    hydrated.preserve_restored_child_startup(current);
-                    let surface = BlocklistAIHistoryModel::as_ref(ctx)
-                        .terminal_surface_id_for_conversation(&conversation_id)
-                        .context("install transcript: missing terminal surface")?;
-                    let terminal = me
+                let result = result.and_then(|conversation| {
+                    let target = me
                         .streams
                         .get(&conversation_id)
-                        .and_then(|stream| stream.restored_owner.as_ref())
-                        .and_then(|owner| owner.upgrade(ctx))
-                        .filter(|owner| owner.id() == surface)
-                        .context("install transcript: missing owner terminal")?;
-                    terminal.update(ctx, |terminal, ctx| {
-                        terminal.restore_conversation_after_view_creation(
-                            RestoredAIConversation::new(hydrated),
-                            true,
-                            RestoreConversationEntryBehavior::PreserveAgentViewState,
-                            ctx,
-                        );
+                        .and_then(|stream| stream.local_child_restoration_target)
+                        .context("install transcript: missing owner")?;
+                    let installation = LocalChildHistoryInstallation {
+                        conversation_id,
+                        generation,
+                        target,
+                    };
+                    ctx.emit(OrchestrationEventStreamerEvent::LocalChildHistoryPrepared {
+                        installation,
+                        conversation: Box::new(conversation),
                     });
-                    BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                        history
-                            .conversation_mut(&conversation_id)
-                            .context("install transcript: conversation missing")?
-                            .set_restored_child_hydration(RestoredChildHydration::Ready);
-                        history.update_conversation_status(
-                            surface,
-                            conversation_id,
-                            ConversationStatus::Success,
-                            ctx,
-                        );
-                        Ok::<_, anyhow::Error>(())
-                    })?;
+                    ctx.spawn(
+                        async { Timer::after(LOCAL_CHILD_HISTORY_INSTALLATION_TIMEOUT).await },
+                        move |me, _, ctx| {
+                            if me.is_current_local_child_history_installation(installation, ctx) {
+                                me.fail_local_child_restoration(
+                                    conversation_id,
+                                    "install transcript: installation was not acknowledged".into(),
+                                    ctx,
+                                );
+                            }
+                        },
+                    );
                     Ok(())
                 });
-                match result {
-                    Ok(()) => me.reevaluate_eligibility(conversation_id, ctx),
-                    Err(error) => {
-                        me.fail_restored_child(conversation_id, format!("{error:#}"), ctx)
-                    }
+                if let Err(error) = result {
+                    me.fail_local_child_restoration(conversation_id, format!("{error:#}"), ctx);
                 }
             },
         );
         true
     }
 
-    pub(crate) fn fail_restored_child(
+    fn is_current_local_child_history_installation(
+        &self,
+        installation: LocalChildHistoryInstallation,
+        ctx: &AppContext,
+    ) -> bool {
+        self.local_child_restoration_status(installation.conversation_id, ctx)
+            == Some(LocalChildRestorationStatus::Restoring)
+            && self
+                .streams
+                .get(&installation.conversation_id)
+                .is_some_and(|stream| {
+                    stream.local_child_restoration_generation == Some(installation.generation)
+                        && stream.local_child_restoration_target == Some(installation.target)
+                })
+    }
+
+    pub(crate) fn begin_local_child_history_installation(
+        &mut self,
+        installation: LocalChildHistoryInstallation,
+        ctx: &AppContext,
+    ) -> bool {
+        if !self.is_current_local_child_history_installation(installation, ctx) {
+            return false;
+        }
+        let stream = self.streams.get_mut(&installation.conversation_id).unwrap();
+        if stream.local_child_history_installation_claimed {
+            return false;
+        }
+        stream.local_child_history_installation_claimed = true;
+        true
+    }
+
+    pub(crate) fn acknowledge_local_child_history_installation(
+        &mut self,
+        installation: LocalChildHistoryInstallation,
+        result: anyhow::Result<()>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !self.is_current_local_child_history_installation(installation, ctx)
+            || !self.streams[&installation.conversation_id].local_child_history_installation_claimed
+        {
+            return;
+        }
+        let conversation_id = installation.conversation_id;
+        let result = result.and_then(|()| {
+            let history = BlocklistAIHistoryModel::as_ref(ctx);
+            anyhow::ensure!(
+                history.terminal_surface_id_for_conversation(&conversation_id)
+                    == Some(installation.target.terminal_id),
+                "install transcript: terminal binding changed"
+            );
+            anyhow::ensure!(
+                history
+                    .conversation(&conversation_id)
+                    .is_some_and(|conversation| { conversation.driver().owns_turn_lifecycle() }),
+                "install transcript: execution conversation missing"
+            );
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                self.streams
+                    .get_mut(&conversation_id)
+                    .unwrap()
+                    .local_child_restoration_generation = None;
+                BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                    history
+                        .conversation_mut(&conversation_id)
+                        .unwrap()
+                        .set_local_child_restoration_status(LocalChildRestorationStatus::Restored);
+                    history.update_conversation_status(
+                        installation.target.terminal_id,
+                        conversation_id,
+                        ConversationStatus::Success,
+                        ctx,
+                    );
+                });
+                self.reevaluate_eligibility(conversation_id, ctx);
+            }
+            Err(error) => self.fail_local_child_restoration(
+                conversation_id,
+                format!("install transcript: {error:#}"),
+                ctx,
+            ),
+        }
+    }
+
+    pub(crate) fn fail_local_child_restoration(
         &mut self,
         conversation_id: AIConversationId,
         stage: String,
         ctx: &mut ModelContext<Self>,
     ) {
+        if let Some(stream) = self.streams.get_mut(&conversation_id) {
+            stream.local_child_restoration_generation = None;
+            stream.local_child_history_installation_claimed = false;
+        }
         let Some(task_id) = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)
             .and_then(AIConversation::task_id)
@@ -314,10 +420,17 @@ impl OrchestrationEventStreamer {
         };
         let message = format!("Local child {task_id} restoration failed: {stage}");
         let surface = BlocklistAIHistoryModel::as_ref(ctx)
-            .terminal_surface_id_for_conversation(&conversation_id);
+            .terminal_surface_id_for_conversation(&conversation_id)
+            .or_else(|| {
+                // Detachment must not hide the diagnostic; this ID only attributes the error event.
+                self.streams
+                    .get(&conversation_id)
+                    .and_then(|stream| stream.local_child_restoration_target)
+                    .map(|target| target.terminal_id)
+            });
         BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
             if let Some(conversation) = history.conversation_mut(&conversation_id) {
-                conversation.set_restored_child_hydration(RestoredChildHydration::Error);
+                conversation.set_local_child_restoration_status(LocalChildRestorationStatus::Error);
                 if let Some(surface) = surface {
                     conversation.update_status_with_error(
                         ConversationStatus::Error,

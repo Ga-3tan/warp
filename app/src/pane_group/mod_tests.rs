@@ -48,7 +48,7 @@ use crate::ai::ambient_agents::{
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::blocklist::history_model::CloudConversationData;
 use crate::ai::blocklist::local_agent_task_sync_model::LocalAgentTaskSyncModel;
-use crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer;
+use crate::ai::blocklist::orchestration_event_streamer::LocalChildRestorationTarget;
 use crate::ai::blocklist::orchestration_events::OrchestrationEventService;
 use crate::ai::blocklist::orchestration_topology::descendant_conversation_ids_in_spawn_order;
 use crate::ai::blocklist::{
@@ -146,7 +146,7 @@ fn restored_local_child_placeholder_promotion_is_idempotent() {
             task.last_event_sequence = Some(19);
             let placeholder =
                 restore_remote_child_conversation(panes, parent_pane, parent_id, task.task_id, ctx);
-            let (owner_id, owner) = panes.prepare_restored_child(
+            let (owner_id, owner) = panes.prepare_restored_local_child(
                 parent_id,
                 parent_terminal.id(),
                 &task,
@@ -157,7 +157,7 @@ fn restored_local_child_placeholder_promotion_is_idempotent() {
             assert_eq!(owner_id, placeholder);
             assert_ne!(terminal.id(), parent_terminal.id());
             let pane_count = panes.pane_ids().count();
-            let (again_id, again) = panes.prepare_restored_child(
+            let (again_id, again) = panes.prepare_restored_local_child(
                 parent_id,
                 parent_terminal.id(),
                 &task,
@@ -188,7 +188,7 @@ fn restored_local_child_placeholder_promotion_is_idempotent() {
 
 #[test]
 fn restored_local_child_owner_setup_error_is_not_retried() {
-    use crate::ai::agent::conversation::RestoredChildHydration;
+    use crate::ai::agent::conversation::LocalChildRestorationStatus;
     App::test((), |mut app| async move {
         initialize_app(&mut app);
         let panes = mock_pane_group(&mut app, Default::default());
@@ -197,17 +197,27 @@ fn restored_local_child_owner_setup_error_is_not_retried() {
             let terminal = panes.terminal_view_from_pane_id(parent_pane, ctx).unwrap();
             let parent_id = start_parent_conversation(panes, parent_pane, ctx);
             let mut task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
-            let (child_id, result) =
-                panes.prepare_restored_child(parent_id, terminal.id(), &task, HashMap::new(), ctx);
+            let (child_id, result) = panes.prepare_restored_local_child(
+                parent_id,
+                terminal.id(),
+                &task,
+                HashMap::new(),
+                ctx,
+            );
             assert!(result.is_err());
             BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
                 let child = history.conversation_mut(&child_id).unwrap();
                 assert_eq!(child.task_id(), Some(task.task_id));
-                child.set_restored_child_hydration(RestoredChildHydration::Error);
+                child.set_local_child_restoration_status(LocalChildRestorationStatus::Error);
             });
             task.conversation_id = Some("later-token".into());
-            let (_, result) =
-                panes.prepare_restored_child(parent_id, terminal.id(), &task, HashMap::new(), ctx);
+            let (_, result) = panes.prepare_restored_local_child(
+                parent_id,
+                terminal.id(),
+                &task,
+                HashMap::new(),
+                ctx,
+            );
             assert!(result.unwrap().is_none());
             assert!(!panes.child_agent_panes.contains_key(&child_id));
         });
@@ -216,7 +226,7 @@ fn restored_local_child_owner_setup_error_is_not_retried() {
 
 #[test]
 fn restored_local_child_deferred_seed_after_hydration() {
-    use crate::ai::agent::conversation::RestoredChildHydration;
+    use crate::ai::agent::conversation::LocalChildRestorationStatus;
 
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -228,7 +238,7 @@ fn restored_local_child_deferred_seed_after_hydration() {
             let parent_run = new_ambient_agent_task_id();
             let mut task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
             task.conversation_id = Some("child-token".into());
-            let (child_id, terminal) = panes.prepare_restored_child(
+            let (child_id, terminal) = panes.prepare_restored_local_child(
                 parent_id,
                 parent_terminal.id(),
                 &task,
@@ -240,7 +250,7 @@ fn restored_local_child_deferred_seed_after_hydration() {
                 history
                     .conversation_mut(&child_id)
                     .unwrap()
-                    .set_restored_child_hydration(RestoredChildHydration::Ready);
+                    .set_local_child_restoration_status(LocalChildRestorationStatus::Restored);
                 history.update_conversation_status(
                     terminal.id(),
                     child_id,
@@ -263,8 +273,8 @@ fn restored_local_child_deferred_seed_after_hydration() {
             let child = history.conversation(&child_id).unwrap();
             assert_eq!(child.status(), &ConversationStatus::InProgress);
             assert_eq!(
-                child.restored_child_hydration(),
-                Some(RestoredChildHydration::Ready)
+                child.local_child_restoration_status(),
+                Some(LocalChildRestorationStatus::Restored)
             );
             assert_eq!(
                 history.terminal_surface_id_for_conversation(&child_id),
@@ -278,7 +288,7 @@ fn restored_local_child_deferred_seed_after_hydration() {
 #[test]
 fn restored_local_child_deferred_seed_after_failure() {
     use crate::ai::agent::RenderableAIError;
-    use crate::ai::agent::conversation::RestoredChildHydration;
+    use crate::ai::agent::conversation::LocalChildRestorationStatus;
 
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -290,12 +300,17 @@ fn restored_local_child_deferred_seed_after_failure() {
             let parent_run = new_ambient_agent_task_id();
             let task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
             let sibling = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
-            let (child_id, result) =
-                panes.prepare_restored_child(parent_id, terminal.id(), &task, HashMap::new(), ctx);
+            let (child_id, result) = panes.prepare_restored_local_child(
+                parent_id,
+                terminal.id(),
+                &task,
+                HashMap::new(),
+                ctx,
+            );
             assert!(result.is_err());
             BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
                 let child = history.conversation_mut(&child_id).unwrap();
-                child.set_restored_child_hydration(RestoredChildHydration::Error);
+                child.set_local_child_restoration_status(LocalChildRestorationStatus::Error);
                 child.update_status_with_error(
                     ConversationStatus::Error,
                     Some(RenderableAIError::other("missing token", false)),
@@ -323,8 +338,8 @@ fn restored_local_child_deferred_seed_after_failure() {
                 Some("missing token")
             );
             assert_eq!(
-                child.restored_child_hydration(),
-                Some(RestoredChildHydration::Error)
+                child.local_child_restoration_status(),
+                Some(LocalChildRestorationStatus::Error)
             );
             let sibling_id = history
                 .conversation_id_for_agent_id(&sibling.task_id.to_string())
@@ -341,7 +356,7 @@ fn restored_local_child_deferred_seed_after_failure() {
 fn restored_local_child_subtree_setup_failure() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use crate::ai::agent::conversation::RestoredChildHydration;
+    use crate::ai::agent::conversation::LocalChildRestorationStatus;
     use crate::server::server_api::ai::MockAIClient;
 
     App::test((), |mut app| async move {
@@ -363,7 +378,7 @@ fn restored_local_child_subtree_setup_failure() {
         });
         let panes = mock_pane_group(&mut app, Default::default());
         panes.update(&mut app, |panes, ctx| {
-            panes.headless_child_owners_ready = false;
+            panes.passive_child_seeding_released = false;
             let pane = panes.focused_pane_id(ctx);
             let root_terminal = panes.terminal_view_from_pane_id(pane, ctx).unwrap();
             let root_id = start_parent_conversation(panes, pane, ctx);
@@ -375,7 +390,7 @@ fn restored_local_child_subtree_setup_failure() {
                     .set_task_id(root_run);
             });
             let child = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
-            let (child_id, failure) = panes.prepare_restored_child(
+            let (child_id, failure) = panes.prepare_restored_local_child(
                 root_id,
                 root_terminal.id(),
                 &child,
@@ -384,11 +399,11 @@ fn restored_local_child_subtree_setup_failure() {
             );
             assert!(failure.is_err());
             streamer.update(ctx, |streamer, ctx| {
-                streamer.fail_restored_child(child_id, "missing token".into(), ctx)
+                streamer.fail_local_child_restoration(child_id, "missing token".into(), ctx)
             });
             let mut grandchild = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
             grandchild.conversation_id = Some("grandchild-token".into());
-            let (grandchild_id, grandchild_terminal) = panes.prepare_restored_child(
+            let (grandchild_id, grandchild_terminal) = panes.prepare_restored_local_child(
                 child_id,
                 root_terminal.id(),
                 &grandchild,
@@ -398,7 +413,7 @@ fn restored_local_child_subtree_setup_failure() {
             let grandchild_terminal = grandchild_terminal.unwrap().unwrap();
             let mut sibling = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
             sibling.conversation_id = Some("sibling-token".into());
-            let (sibling_id, sibling_terminal) = panes.prepare_restored_child(
+            let (sibling_id, sibling_terminal) = panes.prepare_restored_local_child(
                 root_id,
                 root_terminal.id(),
                 &sibling,
@@ -406,13 +421,27 @@ fn restored_local_child_subtree_setup_failure() {
                 ctx,
             );
             let sibling_terminal = sibling_terminal.unwrap().unwrap();
+            let pane_group_id = ctx.view_id();
             streamer.update(ctx, |streamer, ctx| {
-                streamer.register_restored_child(grandchild_id, &grandchild_terminal, ctx);
-                streamer.register_restored_child(sibling_id, &sibling_terminal, ctx);
-                streamer
-                    .release_restored_child_subtree(&[child_id, grandchild_id, sibling_id], ctx);
+                streamer.register_restored_local_child(
+                    grandchild_id,
+                    LocalChildRestorationTarget {
+                        pane_group_id,
+                        terminal_id: grandchild_terminal.id(),
+                    },
+                    ctx,
+                );
+                streamer.register_restored_local_child(
+                    sibling_id,
+                    LocalChildRestorationTarget {
+                        pane_group_id,
+                        terminal_id: sibling_terminal.id(),
+                    },
+                    ctx,
+                );
+                streamer.release_local_subtree_startup(&[child_id, grandchild_id, sibling_id], ctx);
             });
-            panes.release_headless_child_seed(ctx);
+            panes.release_passive_child_seeding(ctx);
 
             let history = BlocklistAIHistoryModel::as_ref(ctx);
             let grandchild = history.conversation(&grandchild_id).unwrap();
@@ -422,8 +451,8 @@ fn restored_local_child_subtree_setup_failure() {
                 Some(child.task_id.to_string().as_str())
             );
             assert_eq!(
-                grandchild.restored_child_hydration(),
-                Some(RestoredChildHydration::Unhydrated)
+                grandchild.local_child_restoration_status(),
+                Some(LocalChildRestorationStatus::Pending)
             );
             assert_eq!(
                 history.conversation(&sibling_id).unwrap().status(),
@@ -437,11 +466,11 @@ fn restored_local_child_subtree_setup_failure() {
                 !history
                     .conversation(&child_id)
                     .unwrap()
-                    .restored_child_execution_ready()
+                    .is_local_child_execution_ready()
             );
             assert!(!panes.child_agent_panes.contains_key(&child_id));
             assert!(panes.child_agent_panes.contains_key(&grandchild_id));
-            assert!(panes.headless_child_owners_ready);
+            assert!(panes.passive_child_seeding_released);
         });
         assert_eventually!(
             reported.load(Ordering::SeqCst),
@@ -452,7 +481,7 @@ fn restored_local_child_subtree_setup_failure() {
 
 #[test]
 fn restored_local_child_subtree_message() {
-    use crate::ai::agent::conversation::RestoredChildHydration;
+    use crate::ai::agent::conversation::LocalChildRestorationStatus;
     use crate::server::server_api::ai::{
         AIClient, MockAIClient, ReadAgentMessageResponse, SendAgentMessageRequest,
     };
@@ -493,7 +522,7 @@ fn restored_local_child_subtree_message() {
         let panes = mock_pane_group(&mut app, Default::default());
         let (child_id, child_terminal, grandchild_id, grandchild_terminal) =
             panes.update(&mut app, |panes, ctx| {
-                panes.headless_child_owners_ready = false;
+                panes.passive_child_seeding_released = false;
                 let root_pane = panes.focused_pane_id(ctx);
                 let root_terminal = panes.terminal_view_from_pane_id(root_pane, ctx).unwrap();
                 let root_id = start_parent_conversation(panes, root_pane, ctx);
@@ -505,7 +534,7 @@ fn restored_local_child_subtree_message() {
                 });
                 let mut child = ambient_agent_task_for_current_user(child_run);
                 child.conversation_id = Some("child-token".into());
-                let (child_id, child_terminal) = panes.prepare_restored_child(
+                let (child_id, child_terminal) = panes.prepare_restored_local_child(
                     root_id,
                     root_terminal.id(),
                     &child,
@@ -521,7 +550,7 @@ fn restored_local_child_subtree_message() {
                     Some(&child_run.to_string()),
                     warp_cli::agent::Harness::Oz,
                 );
-                let (grandchild_id, grandchild_terminal) = panes.prepare_restored_child(
+                let (grandchild_id, grandchild_terminal) = panes.prepare_restored_local_child(
                     child_id,
                     root_terminal.id(),
                     &grandchild,
@@ -529,11 +558,26 @@ fn restored_local_child_subtree_message() {
                     ctx,
                 );
                 let grandchild_terminal = grandchild_terminal.unwrap().unwrap();
+                let pane_group_id = ctx.view_id();
                 streamer.update(ctx, |streamer, ctx| {
-                    streamer.register_restored_child(child_id, &child_terminal, ctx);
-                    streamer.register_restored_child(grandchild_id, &grandchild_terminal, ctx);
-                    streamer.release_restored_child_subtree(&[child_id, grandchild_id], ctx);
-                    streamer.hydrate_restored_child(child_id, ctx);
+                    streamer.register_restored_local_child(
+                        child_id,
+                        LocalChildRestorationTarget {
+                            pane_group_id,
+                            terminal_id: child_terminal.id(),
+                        },
+                        ctx,
+                    );
+                    streamer.register_restored_local_child(
+                        grandchild_id,
+                        LocalChildRestorationTarget {
+                            pane_group_id,
+                            terminal_id: grandchild_terminal.id(),
+                        },
+                        ctx,
+                    );
+                    streamer.release_local_subtree_startup(&[child_id, grandchild_id], ctx);
+                    streamer.restore_local_child(child_id, ctx);
                 });
                 (child_id, child_terminal, grandchild_id, grandchild_terminal)
             });
@@ -541,8 +585,8 @@ fn restored_local_child_subtree_message() {
             BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| history
                 .conversation(&child_id)
                 .unwrap()
-                .restored_child_hydration()
-                == Some(RestoredChildHydration::Ready)),
+                .local_child_restoration_status()
+                == Some(LocalChildRestorationStatus::Restored)),
             "intermediate parent did not hydrate"
         );
         BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| {
@@ -550,8 +594,8 @@ fn restored_local_child_subtree_message() {
                 history
                     .conversation(&grandchild_id)
                     .unwrap()
-                    .restored_child_hydration(),
-                Some(RestoredChildHydration::Unhydrated)
+                    .local_child_restoration_status(),
+                Some(LocalChildRestorationStatus::Pending)
             );
             assert_eq!(
                 history.child_conversation_ids_of(&child_id),
@@ -637,12 +681,12 @@ fn restored_local_child_subtree_message() {
             assert_eq!(grandchild.parent_conversation_id(), Some(child_id));
             assert_eq!(grandchild.parent_agent_id(), Some(child_run.to_string().as_str()));
             assert_eq!(grandchild.server_conversation_token().unwrap().as_str(), "grandchild-token");
-            assert_eq!(grandchild.restored_child_hydration(), Some(RestoredChildHydration::Ready));
+            assert_eq!(grandchild.local_child_restoration_status(), Some(LocalChildRestorationStatus::Restored));
             assert_eq!(grandchild.last_event_sequence(), Some(24));
             assert_eq!(grandchild.get_root_task_id().to_string(), "existing-root");
             let exchange = grandchild.root_task_exchanges().last().unwrap();
             assert!(exchange.input.iter().any(|input| matches!(input, crate::ai::agent::AIAgentInput::MessagesReceivedFromAgents { messages } if messages[0].sender_agent_id == child_run.to_string())));
-            assert_eq!(panes.restored_child_owners.len(), 2);
+            assert_eq!(panes.restored_local_descendant_conversations.len(), 2);
             assert_eq!(panes.child_agent_panes.len(), 2);
             assert_eq!(grandchild_terminal.as_ref(ctx).ai_controller().as_ref(ctx).get_ambient_agent_task_id(), Some(grandchild_run));
             assert_ne!(grandchild_terminal.id(), child_terminal.id());
@@ -4696,3 +4740,6 @@ fn test_undo_close_keeps_a_file_pane_watching_its_file() {
         });
     });
 }
+
+#[path = "local_child_restoration_tests.rs"]
+mod local_child_restoration;

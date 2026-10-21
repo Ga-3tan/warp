@@ -81,7 +81,7 @@ fn restored_local_child_subtree_discovery() {
             .returning(move |_, _| Ok(response.take().unwrap()));
     }
 
-    let batches = futures::executor::block_on(discover_local_child_subtree(
+    let batches = futures::executor::block_on(list_local_subtree(
         &client,
         uuid::Uuid::from_u128(9999).to_string().parse().unwrap(),
     ))
@@ -153,7 +153,7 @@ fn restored_local_child_subtree_incomplete() {
                 .returning(|_, _| Err(anyhow::anyhow!("child list unavailable")));
         }
 
-        let result = futures::executor::block_on(discover_local_child_subtree(
+        let result = futures::executor::block_on(list_local_subtree(
             &client,
             uuid::Uuid::from_u128(9999).to_string().parse().unwrap(),
         ));
@@ -193,7 +193,7 @@ fn restored_local_child_discovery_pages() {
         .times(1)
         .in_sequence(&mut sequence)
         .returning(|_, _| Ok(page(vec![run(99), run(100), run(101)], false, None)));
-    let children = futures::executor::block_on(discover_direct_children(
+    let children = futures::executor::block_on(list_direct_children(
         &client,
         uuid::Uuid::from_u128(9999).to_string().parse().unwrap(),
     ))
@@ -273,7 +273,7 @@ fn restored_local_child_discovery_rejects_incomplete_traversal() {
                 .unwrap_or_else(|| page(vec![run(2)], true, Some("page-2"))))
         });
         assert!(
-            futures::executor::block_on(discover_direct_children(
+            futures::executor::block_on(list_direct_children(
                 &client,
                 uuid::Uuid::from_u128(9999).to_string().parse().unwrap(),
             ))
@@ -309,7 +309,7 @@ fn restored_local_child_classification() {
         }
         let task: AmbientAgentTask = serde_json::from_value(row).unwrap();
         assert_eq!(
-            needs_restored_local_owner(&task),
+            is_native_local_run(&task),
             expected,
             "{location} {harness:?}"
         );

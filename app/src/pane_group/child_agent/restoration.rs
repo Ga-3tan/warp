@@ -11,7 +11,7 @@ use super::{HiddenChildAgentTaskContext, apply_hidden_child_agent_task_context};
 use crate::ai::agent::conversation::{AIConversation, AIConversationId};
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
-use crate::ai::ambient_agents::discovery::discover_direct_children;
+use crate::ai::ambient_agents::discovery::list_direct_children;
 use crate::ai::ambient_agents::task::AmbientAgentTask;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
@@ -175,7 +175,7 @@ impl PaneGroup {
         parent_task_id: AmbientAgentTaskId,
         ctx: &mut ViewContext<Self>,
     ) {
-        if !self.headless_child_owners_ready {
+        if !self.passive_child_seeding_released {
             return;
         }
         let Some(seed) = self.pending_parent_child_seeds.get(&parent_task_id) else {
@@ -198,7 +198,7 @@ impl PaneGroup {
 
         let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
         ctx.spawn(
-            async move { discover_direct_children(ai_client.as_ref(), parent_task_id).await },
+            async move { list_direct_children(ai_client.as_ref(), parent_task_id).await },
             move |me, result, ctx| {
                 if is_stale_ancestor_list_completion(
                     me.pending_parent_child_seeds.get(&parent_task_id),
@@ -431,7 +431,7 @@ impl PaneGroup {
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         OrchestrationEventStreamer::handle(ctx).update(ctx, |streamer, ctx| {
-            streamer.hydrate_restored_child(child_conversation_id, ctx);
+            streamer.restore_local_child(child_conversation_id, ctx);
         });
         if self
             .child_agent_panes
