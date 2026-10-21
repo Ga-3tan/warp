@@ -6,7 +6,7 @@ The new VM can show the parent's children, but it cannot receive messages for na
 Restore the co-resident native-local **subtree**, not only the root's direct children.
 Each descendant keeps its immediate parent and its own execution conversation in the resumed root process.
 Subscribe to the child's events immediately; load its full conversation only on its first message or pane open.
-The subtree contract below is proposed for approval; implementation must wait for that approval.
+The requester approved the subtree contract below for implementation.
 
 ## Handoff contract
 1. Child restoration inherits the parent's existing handoff and workload-credential safeguards. Do not require an additional physical-VM-destruction barrier or introduce child-specific fencing; predecessor teardown may still be in progress.

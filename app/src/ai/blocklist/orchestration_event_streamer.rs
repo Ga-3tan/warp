@@ -996,7 +996,7 @@ impl OrchestrationEventStreamer {
     /// looking them up via `ServerApiProvider`. Lets unit tests inject a
     /// `MockAIClient` while still subscribing to `BlocklistAIHistoryModel`.
     #[cfg(test)]
-    pub(super) fn new_with_clients_for_test(
+    pub(crate) fn new_with_clients_for_test(
         ai_client: Arc<dyn AIClient>,
         server_api: Arc<ServerApi>,
         ctx: &mut ModelContext<Self>,
@@ -2153,11 +2153,9 @@ impl OrchestrationEventStreamer {
     /// conversation has a real role to consume events for. Passive views
     /// of agent runs hosted elsewhere are excluded regardless of state.
     fn is_eligible(&self, conversation_id: AIConversationId, ctx: &warpui::AppContext) -> bool {
-        if self
-            .restored_child_state(conversation_id, ctx)
-            .is_some_and(|state| {
-                state != crate::ai::agent::conversation::RestoredChildHydration::Ready
-            })
+        if BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .is_some_and(|conversation| !conversation.restored_child_execution_ready())
         {
             return false;
         }

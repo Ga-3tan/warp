@@ -6,16 +6,12 @@ use warp_cli::agent::Harness;
 use warpui::{EntityId, SingletonEntity, ViewContext, ViewHandle};
 
 use crate::ai::agent::conversation::{AIConversation, AIConversationId, RestoredChildHydration};
-use crate::ai::ambient_agents::task::{AmbientAgentTask, ExecutionLocation};
+use crate::ai::ambient_agents::discovery::needs_restored_local_owner;
+use crate::ai::ambient_agents::task::AmbientAgentTask;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::ai::blocklist::orchestration_event_streamer::agent_task_harness;
 use crate::pane_group::PaneGroup;
 use crate::terminal::TerminalView;
-
-#[cfg_attr(target_family = "wasm", allow(dead_code))]
-pub(crate) fn needs_restored_local_owner(task: &AmbientAgentTask) -> bool {
-    task.execution_location == Some(ExecutionLocation::Local) && !task.is_third_party_harness()
-}
 
 impl PaneGroup {
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
@@ -24,7 +20,7 @@ impl PaneGroup {
         self.process_pending_parent_child_seeds(ctx);
     }
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    pub(crate) fn prepare_restored_child_owner(
+    pub(crate) fn prepare_restored_child(
         &mut self,
         parent_conversation_id: AIConversationId,
         parent_terminal_id: EntityId,
@@ -35,6 +31,10 @@ impl PaneGroup {
         AIConversationId,
         anyhow::Result<Option<ViewHandle<TerminalView>>>,
     ) {
+        let parent_terminal_id = self
+            .pane_id_for_owned_conversation(parent_conversation_id, ctx)
+            .and_then(|pane| self.terminal_view_from_pane_id(pane, ctx))
+            .map_or(parent_terminal_id, |terminal| terminal.id());
         let existing = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation_id_for_agent_id(&task.task_id.to_string());
         let child_id = existing
@@ -113,6 +113,10 @@ impl PaneGroup {
         children: &[AmbientAgentTask],
         ctx: &mut ViewContext<Self>,
     ) {
+        let parent_terminal_id = self
+            .pane_id_for_owned_conversation(parent_conversation_id, ctx)
+            .and_then(|pane| self.terminal_view_from_pane_id(pane, ctx))
+            .map_or(parent_terminal_id, |terminal| terminal.id());
         for task in children {
             if needs_restored_local_owner(task) {
                 continue;
@@ -131,7 +135,5 @@ impl PaneGroup {
                 history.apply_remote_child_task_snapshot(parent_terminal_id, child_id, task, ctx);
             });
         }
-        self.headless_child_owners_ready = true;
-        self.process_pending_parent_child_seeds(ctx);
     }
 }

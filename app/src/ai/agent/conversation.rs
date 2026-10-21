@@ -441,6 +441,7 @@ pub struct AIConversation {
     /// conversation resumes ordinary synchronization.
     task_sync_mode: TaskSyncMode,
     restored_child_hydration: Option<RestoredChildHydration>,
+    restored_child_startup_pending: bool,
 
     /// Whether the user chose Warp-funded inference for this conversation after a ChatGPT
     /// token-sharing failure. Sticky for the rest of the conversation and inherited by forks.
@@ -519,6 +520,7 @@ impl AIConversation {
             remote_run_updated_at: None,
             task_sync_mode: TaskSyncMode::default(),
             restored_child_hydration: None,
+            restored_child_startup_pending: false,
             use_warp_credits_instead_of_chatgpt: false,
         }
     }
@@ -780,6 +782,7 @@ impl AIConversation {
             task_sync_mode: TaskSyncMode::default(),
             restored_child_hydration: None,
             use_warp_credits_instead_of_chatgpt,
+            restored_child_startup_pending: false,
         })
     }
 
@@ -793,6 +796,7 @@ impl AIConversation {
         conversation.id = id;
         conversation.status = ConversationStatus::Success;
         conversation.restored_child_hydration = Some(RestoredChildHydration::Unhydrated);
+        conversation.restored_child_startup_pending = true;
         conversation
     }
 
@@ -802,6 +806,22 @@ impl AIConversation {
 
     pub(crate) fn set_restored_child_hydration(&mut self, state: RestoredChildHydration) {
         self.restored_child_hydration = Some(state);
+    }
+
+    pub(crate) fn restored_child_execution_ready(&self) -> bool {
+        !self.restored_child_startup_pending
+            && self
+                .restored_child_hydration
+                .is_none_or(|state| state == RestoredChildHydration::Ready)
+    }
+
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub(crate) fn release_restored_child_startup(&mut self) {
+        self.restored_child_startup_pending = false;
+    }
+
+    pub(crate) fn preserve_restored_child_startup(&mut self, current: &Self) {
+        self.restored_child_startup_pending = current.restored_child_startup_pending;
     }
 
     /// Assigns fresh exchange IDs to all exchanges in this conversation.

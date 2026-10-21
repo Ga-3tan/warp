@@ -146,7 +146,7 @@ fn restored_local_child_placeholder_promotion_is_idempotent() {
             task.last_event_sequence = Some(19);
             let placeholder =
                 restore_remote_child_conversation(panes, parent_pane, parent_id, task.task_id, ctx);
-            let (owner_id, owner) = panes.prepare_restored_child_owner(
+            let (owner_id, owner) = panes.prepare_restored_child(
                 parent_id,
                 parent_terminal.id(),
                 &task,
@@ -157,7 +157,7 @@ fn restored_local_child_placeholder_promotion_is_idempotent() {
             assert_eq!(owner_id, placeholder);
             assert_ne!(terminal.id(), parent_terminal.id());
             let pane_count = panes.pane_ids().count();
-            let (again_id, again) = panes.prepare_restored_child_owner(
+            let (again_id, again) = panes.prepare_restored_child(
                 parent_id,
                 parent_terminal.id(),
                 &task,
@@ -197,13 +197,8 @@ fn restored_local_child_owner_setup_error_is_not_retried() {
             let terminal = panes.terminal_view_from_pane_id(parent_pane, ctx).unwrap();
             let parent_id = start_parent_conversation(panes, parent_pane, ctx);
             let mut task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
-            let (child_id, result) = panes.prepare_restored_child_owner(
-                parent_id,
-                terminal.id(),
-                &task,
-                HashMap::new(),
-                ctx,
-            );
+            let (child_id, result) =
+                panes.prepare_restored_child(parent_id, terminal.id(), &task, HashMap::new(), ctx);
             assert!(result.is_err());
             BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
                 let child = history.conversation_mut(&child_id).unwrap();
@@ -211,20 +206,459 @@ fn restored_local_child_owner_setup_error_is_not_retried() {
                 child.set_restored_child_hydration(RestoredChildHydration::Error);
             });
             task.conversation_id = Some("later-token".into());
-            let (_, result) = panes.prepare_restored_child_owner(
-                parent_id,
-                terminal.id(),
-                &task,
-                HashMap::new(),
-                ctx,
-            );
+            let (_, result) =
+                panes.prepare_restored_child(parent_id, terminal.id(), &task, HashMap::new(), ctx);
             assert!(result.unwrap().is_none());
             assert!(!panes.child_agent_panes.contains_key(&child_id));
         });
     });
 }
 
+#[test]
+fn restored_local_child_deferred_seed_after_hydration() {
+    use crate::ai::agent::conversation::RestoredChildHydration;
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let panes = mock_pane_group(&mut app, Default::default());
+        panes.update(&mut app, |panes, ctx| {
+            let parent_pane = panes.focused_pane_id(ctx);
+            let parent_terminal = panes.terminal_view_from_pane_id(parent_pane, ctx).unwrap();
+            let parent_id = start_parent_conversation(panes, parent_pane, ctx);
+            let parent_run = new_ambient_agent_task_id();
+            let mut task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            task.conversation_id = Some("child-token".into());
+            let (child_id, terminal) = panes.prepare_restored_child(
+                parent_id,
+                parent_terminal.id(),
+                &task,
+                HashMap::new(),
+                ctx,
+            );
+            let terminal = terminal.unwrap().unwrap();
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                history
+                    .conversation_mut(&child_id)
+                    .unwrap()
+                    .set_restored_child_hydration(RestoredChildHydration::Ready);
+                history.update_conversation_status(
+                    terminal.id(),
+                    child_id,
+                    ConversationStatus::InProgress,
+                    ctx,
+                );
+            });
+            AgentConversationsModel::handle(ctx).update(ctx, |model, _| {
+                model.insert_task_for_test(task.clone());
+            });
+
+            panes.finish_seed_child_conversations_from_task(
+                parent_id,
+                parent_run,
+                Ok(vec![task]),
+                ctx,
+            );
+
+            let history = BlocklistAIHistoryModel::as_ref(ctx);
+            let child = history.conversation(&child_id).unwrap();
+            assert_eq!(child.status(), &ConversationStatus::InProgress);
+            assert_eq!(
+                child.restored_child_hydration(),
+                Some(RestoredChildHydration::Ready)
+            );
+            assert_eq!(
+                history.terminal_surface_id_for_conversation(&child_id),
+                Some(terminal.id())
+            );
+            assert_eq!(child.parent_conversation_id(), Some(parent_id));
+        });
+    });
+}
+
+#[test]
+fn restored_local_child_deferred_seed_after_failure() {
+    use crate::ai::agent::RenderableAIError;
+    use crate::ai::agent::conversation::RestoredChildHydration;
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let panes = mock_pane_group(&mut app, Default::default());
+        panes.update(&mut app, |panes, ctx| {
+            let parent_pane = panes.focused_pane_id(ctx);
+            let terminal = panes.terminal_view_from_pane_id(parent_pane, ctx).unwrap();
+            let parent_id = start_parent_conversation(panes, parent_pane, ctx);
+            let parent_run = new_ambient_agent_task_id();
+            let task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            let sibling = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            let (child_id, result) =
+                panes.prepare_restored_child(parent_id, terminal.id(), &task, HashMap::new(), ctx);
+            assert!(result.is_err());
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                let child = history.conversation_mut(&child_id).unwrap();
+                child.set_restored_child_hydration(RestoredChildHydration::Error);
+                child.update_status_with_error(
+                    ConversationStatus::Error,
+                    Some(RenderableAIError::other("missing token", false)),
+                    terminal.id(),
+                    ctx,
+                );
+            });
+            AgentConversationsModel::handle(ctx).update(ctx, |model, _| {
+                model.insert_task_for_test(task.clone());
+                model.insert_task_for_test(sibling.clone());
+            });
+
+            panes.finish_seed_child_conversations_from_task(
+                parent_id,
+                parent_run,
+                Ok(vec![task, sibling.clone()]),
+                ctx,
+            );
+
+            let history = BlocklistAIHistoryModel::as_ref(ctx);
+            let child = history.conversation(&child_id).unwrap();
+            assert_eq!(child.status(), &ConversationStatus::Error);
+            assert_eq!(
+                child.status_error_message().as_deref(),
+                Some("missing token")
+            );
+            assert_eq!(
+                child.restored_child_hydration(),
+                Some(RestoredChildHydration::Error)
+            );
+            let sibling_id = history
+                .conversation_id_for_agent_id(&sibling.task_id.to_string())
+                .unwrap();
+            assert!(history.conversation(&sibling_id).unwrap().is_remote_child());
+            assert_eq!(
+                history.conversation(&sibling_id).unwrap().status(),
+                &ConversationStatus::Success
+            );
+        });
+    });
+}
+#[test]
+fn restored_local_child_subtree_setup_failure() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::ai::agent::conversation::RestoredChildHydration;
+    use crate::server::server_api::ai::MockAIClient;
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let mut client = MockAIClient::new();
+        let reported = Arc::new(AtomicBool::new(false));
+        client.expect_update_agent_task().times(1).returning({
+            let reported = reported.clone();
+            move |_, state, _, _, status, _, _| {
+                assert_eq!(state, Some(warp_graphql::ai::AgentTaskState::Error));
+                assert!(status.is_some());
+                reported.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        let server = ServerApiProvider::new_for_test().get();
+        let streamer = app.add_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(Arc::new(client), server, ctx)
+        });
+        let panes = mock_pane_group(&mut app, Default::default());
+        panes.update(&mut app, |panes, ctx| {
+            panes.headless_child_owners_ready = false;
+            let pane = panes.focused_pane_id(ctx);
+            let root_terminal = panes.terminal_view_from_pane_id(pane, ctx).unwrap();
+            let root_id = start_parent_conversation(panes, pane, ctx);
+            let root_run = new_ambient_agent_task_id();
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
+                history
+                    .conversation_mut(&root_id)
+                    .unwrap()
+                    .set_task_id(root_run);
+            });
+            let child = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            let (child_id, failure) = panes.prepare_restored_child(
+                root_id,
+                root_terminal.id(),
+                &child,
+                HashMap::new(),
+                ctx,
+            );
+            assert!(failure.is_err());
+            streamer.update(ctx, |streamer, ctx| {
+                streamer.fail_restored_child(child_id, "missing token".into(), ctx)
+            });
+            let mut grandchild = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            grandchild.conversation_id = Some("grandchild-token".into());
+            let (grandchild_id, grandchild_terminal) = panes.prepare_restored_child(
+                child_id,
+                root_terminal.id(),
+                &grandchild,
+                HashMap::new(),
+                ctx,
+            );
+            let grandchild_terminal = grandchild_terminal.unwrap().unwrap();
+            let mut sibling = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            sibling.conversation_id = Some("sibling-token".into());
+            let (sibling_id, sibling_terminal) = panes.prepare_restored_child(
+                root_id,
+                root_terminal.id(),
+                &sibling,
+                HashMap::new(),
+                ctx,
+            );
+            let sibling_terminal = sibling_terminal.unwrap().unwrap();
+            streamer.update(ctx, |streamer, ctx| {
+                streamer.register_restored_child(grandchild_id, &grandchild_terminal, ctx);
+                streamer.register_restored_child(sibling_id, &sibling_terminal, ctx);
+                streamer
+                    .release_restored_child_subtree(&[child_id, grandchild_id, sibling_id], ctx);
+            });
+            panes.release_headless_child_seed(ctx);
+
+            let history = BlocklistAIHistoryModel::as_ref(ctx);
+            let grandchild = history.conversation(&grandchild_id).unwrap();
+            assert_eq!(grandchild.parent_conversation_id(), Some(child_id));
+            assert_eq!(
+                grandchild.parent_agent_id(),
+                Some(child.task_id.to_string().as_str())
+            );
+            assert_eq!(
+                grandchild.restored_child_hydration(),
+                Some(RestoredChildHydration::Unhydrated)
+            );
+            assert_eq!(
+                history.conversation(&sibling_id).unwrap().status(),
+                &ConversationStatus::Success
+            );
+            assert_eq!(
+                history.conversation(&child_id).unwrap().status(),
+                &ConversationStatus::Error
+            );
+            assert!(
+                !history
+                    .conversation(&child_id)
+                    .unwrap()
+                    .restored_child_execution_ready()
+            );
+            assert!(!panes.child_agent_panes.contains_key(&child_id));
+            assert!(panes.child_agent_panes.contains_key(&grandchild_id));
+            assert!(panes.headless_child_owners_ready);
+        });
+        assert_eventually!(
+            reported.load(Ordering::SeqCst),
+            "intermediate setup Error was not reported"
+        );
+    });
+}
+
+#[test]
+fn restored_local_child_subtree_message() {
+    use crate::ai::agent::conversation::RestoredChildHydration;
+    use crate::server::server_api::ai::{
+        AIClient, MockAIClient, ReadAgentMessageResponse, SendAgentMessageRequest,
+    };
+
+    App::test((), |mut app| async move {
+        let child_run = new_ambient_agent_task_id();
+        let grandchild_run = new_ambient_agent_task_id();
+        let mut client = MockAIClient::new();
+        client
+            .expect_get_ai_conversation()
+            .times(2)
+            .returning(move |token| {
+                let task_id = if token.as_str() == "child-token" {
+                    child_run
+                } else {
+                    assert_eq!(token.as_str(), "grandchild-token");
+                    grandchild_run
+                };
+                let mut metadata = test_server_conversation_metadata(Some(task_id));
+                metadata.server_conversation_token = token;
+                Ok((
+                    warp_multi_agent_api::ConversationData {
+                        tasks: vec![warp_multi_agent_api::Task {
+                            id: "existing-root".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    metadata,
+                ))
+            });
+        client
+            .expect_update_event_sequence_on_server()
+            .returning(|_, _| Ok(()));
+        initialize_app_with_streamer(&mut app, Vec::new(), Some(Arc::new(client)));
+        let server_api = ServerApiProvider::new_for_test().get();
+        let streamer = OrchestrationEventStreamer::handle(&app);
+        let panes = mock_pane_group(&mut app, Default::default());
+        let (child_id, child_terminal, grandchild_id, grandchild_terminal) =
+            panes.update(&mut app, |panes, ctx| {
+                panes.headless_child_owners_ready = false;
+                let root_pane = panes.focused_pane_id(ctx);
+                let root_terminal = panes.terminal_view_from_pane_id(root_pane, ctx).unwrap();
+                let root_id = start_parent_conversation(panes, root_pane, ctx);
+                BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
+                    history
+                        .conversation_mut(&root_id)
+                        .unwrap()
+                        .set_task_id(new_ambient_agent_task_id());
+                });
+                let mut child = ambient_agent_task_for_current_user(child_run);
+                child.conversation_id = Some("child-token".into());
+                let (child_id, child_terminal) = panes.prepare_restored_child(
+                    root_id,
+                    root_terminal.id(),
+                    &child,
+                    HashMap::new(),
+                    ctx,
+                );
+                let child_terminal = child_terminal.unwrap().unwrap();
+                let mut grandchild = ambient_agent_task_for_current_user(grandchild_run);
+                grandchild.conversation_id = Some("grandchild-token".into());
+                grandchild.last_event_sequence = Some(23);
+                let env = crate::ai::agent_sdk::task_env_vars(
+                    Some(&grandchild_run),
+                    Some(&child_run.to_string()),
+                    warp_cli::agent::Harness::Oz,
+                );
+                let (grandchild_id, grandchild_terminal) = panes.prepare_restored_child(
+                    child_id,
+                    root_terminal.id(),
+                    &grandchild,
+                    env,
+                    ctx,
+                );
+                let grandchild_terminal = grandchild_terminal.unwrap().unwrap();
+                streamer.update(ctx, |streamer, ctx| {
+                    streamer.register_restored_child(child_id, &child_terminal, ctx);
+                    streamer.register_restored_child(grandchild_id, &grandchild_terminal, ctx);
+                    streamer.release_restored_child_subtree(&[child_id, grandchild_id], ctx);
+                    streamer.hydrate_restored_child(child_id, ctx);
+                });
+                (child_id, child_terminal, grandchild_id, grandchild_terminal)
+            });
+        assert_eventually!(
+            BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| history
+                .conversation(&child_id)
+                .unwrap()
+                .restored_child_hydration()
+                == Some(RestoredChildHydration::Ready)),
+            "intermediate parent did not hydrate"
+        );
+        BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| {
+            assert_eq!(
+                history
+                    .conversation(&grandchild_id)
+                    .unwrap()
+                    .restored_child_hydration(),
+                Some(RestoredChildHydration::Unhydrated)
+            );
+            assert_eq!(
+                history.child_conversation_ids_of(&child_id),
+                &[grandchild_id]
+            );
+        });
+        let send = ChannelState::mock_server()
+            .mock("POST", "/api/v1/agent/messages")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "sender_run_id": child_run.to_string(), "to": [grandchild_run.to_string()]
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message_ids":["nested-message"]}"#)
+            .expect(1)
+            .create();
+        server_api
+            .send_agent_message(SendAgentMessageRequest {
+                to: vec![grandchild_run.to_string()],
+                subject: "continue".into(),
+                body: "use your previous work".into(),
+                sender_run_id: child_run.to_string(),
+            })
+            .await
+            .unwrap();
+        send.assert();
+        let event = serde_json::json!({
+            "event_type": "new_message", "run_id": grandchild_run.to_string(),
+            "ref_id": "nested-message", "sequence": 24,
+            "occurred_at": "2026-10-01T00:00:00Z"
+        });
+        let _task = ChannelState::mock_server()
+            .mock(
+                "GET",
+                format!("/api/v1/agent/runs/{grandchild_run}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::to_string(&ambient_agent_task_for_current_user(grandchild_run))
+                    .unwrap(),
+            )
+            .create();
+        let message = ChannelState::mock_server()
+            .mock("POST", "/api/v1/agent/messages/nested-message/read")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::to_string(&ReadAgentMessageResponse {
+                    message_id: "nested-message".into(),
+                    sender_run_id: child_run.to_string(),
+                    subject: "continue".into(),
+                    body: "use your previous work".into(),
+                    sent_at: "2026-10-01T00:00:00Z".into(),
+                    delivered_at: None,
+                    read_at: None,
+                })
+                .unwrap(),
+            )
+            .expect(1)
+            .create();
+        let events = ChannelState::mock_server()
+            .mock("GET", "/api/v1/agent/events/stream")
+            .match_query(Matcher::Regex(format!(
+                "run_ids.*{grandchild_run}.*since=23"
+            )))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(format!("data: {event}\n\n"))
+            .expect_at_least(2)
+            .create();
+
+        assert_eventually!(1000 =>
+            grandchild_terminal.read(&app, |terminal, ctx| terminal.ai_controller().as_ref(ctx).has_active_stream_for_conversation(grandchild_id, ctx)),
+            "grandchild did not wake, hydrate, replay, and start its next request"
+        );
+        events.assert();
+        message.assert();
+        panes.update(&mut app, |panes, ctx| {
+            let history = BlocklistAIHistoryModel::as_ref(ctx);
+            let grandchild = history.conversation(&grandchild_id).unwrap();
+            assert_eq!(grandchild.task_id(), Some(grandchild_run));
+            assert_eq!(grandchild.parent_conversation_id(), Some(child_id));
+            assert_eq!(grandchild.parent_agent_id(), Some(child_run.to_string().as_str()));
+            assert_eq!(grandchild.server_conversation_token().unwrap().as_str(), "grandchild-token");
+            assert_eq!(grandchild.restored_child_hydration(), Some(RestoredChildHydration::Ready));
+            assert_eq!(grandchild.last_event_sequence(), Some(24));
+            assert_eq!(grandchild.get_root_task_id().to_string(), "existing-root");
+            let exchange = grandchild.root_task_exchanges().last().unwrap();
+            assert!(exchange.input.iter().any(|input| matches!(input, crate::ai::agent::AIAgentInput::MessagesReceivedFromAgents { messages } if messages[0].sender_agent_id == child_run.to_string())));
+            assert_eq!(panes.restored_child_owners.len(), 2);
+            assert_eq!(panes.child_agent_panes.len(), 2);
+            assert_eq!(grandchild_terminal.as_ref(ctx).ai_controller().as_ref(ctx).get_ambient_agent_task_id(), Some(grandchild_run));
+            assert_ne!(grandchild_terminal.id(), child_terminal.id());
+        });
+    });
+}
+
 fn initialize_app_with_history(app: &mut App, conversations: Vec<AgentConversation>) {
+    initialize_app_with_streamer(app, conversations, None);
+}
+
+fn initialize_app_with_streamer(
+    app: &mut App,
+    conversations: Vec<AgentConversation>,
+    ai_client: Option<Arc<dyn crate::server::server_api::ai::AIClient>>,
+) {
     initialize_settings_for_tests(app);
 
     app.add_singleton_model(|_ctx| ServerApiProvider::new_for_test());
@@ -292,11 +726,21 @@ fn initialize_app_with_history(app: &mut App, conversations: Vec<AgentConversati
     });
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
     app.add_singleton_model(OrchestrationEventService::new);
+    app.add_singleton_model(
+        crate::terminal::view::inline_banner::ByoLlmAuthBannerSessionState::new,
+    );
     app.add_singleton_model(LocalAgentTaskSyncModel::new);
     app.add_singleton_model(
         crate::ai::blocklist::pending_cli_harness_prompt_queue::PendingCliHarnessPromptQueue::new,
     );
-    app.add_singleton_model(OrchestrationEventStreamer::new);
+    app.add_singleton_model(|ctx| match ai_client {
+        Some(client) => OrchestrationEventStreamer::new_with_clients_for_test(
+            client,
+            ServerApiProvider::as_ref(ctx).get(),
+            ctx,
+        ),
+        None => OrchestrationEventStreamer::new(ctx),
+    });
     app.add_singleton_model(|_| ActiveAgentViewsModel::new());
     app.add_singleton_model(crate::ai::blocklist::BlocklistAIPermissions::new);
     app.add_singleton_model(AgentNotificationsModel::new);

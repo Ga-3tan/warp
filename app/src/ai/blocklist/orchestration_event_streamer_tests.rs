@@ -52,7 +52,7 @@ fn sse_backoff_escalates_then_caps() {
 }
 
 #[test]
-fn restored_local_child_hydration_gate() {
+fn restored_local_child_subtree_startup_gate() {
     use crate::ai::agent::conversation::RestoredChildHydration;
     use crate::test_util::terminal::{add_window_with_terminal, initialize_app_for_terminal_view};
 
@@ -63,6 +63,18 @@ fn restored_local_child_hydration_gate() {
         let parent_id = AIConversationId::new();
         let child_task_id = make_parent_task_id_for_test(0xe9);
         let parent_task_id = make_parent_task_id_for_test(0xe8);
+        let _task = warp_core::channel::ChannelState::mock_server()
+            .mock(
+                "GET",
+                format!("/api/v1/agent/runs/{child_task_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::to_string(&make_ambient_task_with_task_id(child_task_id, Some(23)))
+                    .unwrap(),
+            )
+            .create();
         let mut child = AIConversation::new_restored_child(child_id);
         child.set_task_id(child_task_id);
         child.set_parent_agent_id(parent_task_id.to_string());
@@ -95,7 +107,7 @@ fn restored_local_child_hydration_gate() {
             OrchestrationEventStreamer::new_with_clients_for_test(Arc::new(client), server_api, ctx)
         });
         streamer.update(&mut app, |streamer, ctx| {
-            streamer.register_restored_child_owner(child_id, &terminal, ctx);
+            streamer.register_restored_child(child_id, &terminal, ctx);
             assert!(streamer.streams[&child_id].wake_connection.is_some());
             assert!(streamer.streams[&child_id].sse_connection.is_none());
             assert!(streamer.hydrate_restored_child(child_id, ctx));
@@ -129,13 +141,70 @@ fn restored_local_child_hydration_gate() {
                 Some(terminal.id())
             );
             assert_eq!(streamer.streams[&child_id].event_cursor, 23);
+            assert!(streamer.streams[&child_id].sse_connection.is_none());
+            assert!(!child.restored_child_execution_ready());
+        });
+        let grandchild_terminal = add_window_with_terminal(&mut app, None);
+        let grandchild_id = AIConversationId::new();
+        let mut grandchild = AIConversation::new_restored_child(grandchild_id);
+        grandchild.set_task_id(make_parent_task_id_for_test(0xea));
+        grandchild.set_parent_agent_id(child_task_id.to_string());
+        grandchild.set_parent_conversation_id(child_id);
+        grandchild.set_server_conversation_token("grandchild-token".into());
+        BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+            history.restore_conversations(grandchild_terminal.id(), vec![grandchild], ctx);
+        });
+        OrchestrationEventService::handle(&app).update(&mut app, |service, ctx| {
+            service.enqueue_event_batch(
+                child_id,
+                build_pending_events(
+                    vec![ReceivedMessageInput {
+                        message_id: "pending-during-startup".into(),
+                        sender_agent_id: parent_task_id.to_string(),
+                        addresses: vec![child_task_id.to_string()],
+                        subject: "work".into(),
+                        message_body: "continue".into(),
+                    }],
+                    vec![],
+                ),
+                ctx,
+            );
+        });
+        terminal.read(&app, |terminal, ctx| {
+            assert!(
+                !terminal
+                    .ai_controller()
+                    .as_ref(ctx)
+                    .has_active_stream_for_conversation(child_id, ctx)
+            );
+        });
+        streamer.update(&mut app, |streamer, ctx| {
+            streamer.register_restored_child(grandchild_id, &grandchild_terminal, ctx);
+            assert!(streamer.streams[&grandchild_id].wake_connection.is_some());
+            streamer.release_restored_child_subtree(&[child_id, grandchild_id], ctx);
+        });
+        crate::test_util::assert_eventually!(
+            terminal.read(&app, |terminal, ctx| terminal
+                .ai_controller()
+                .as_ref(ctx)
+                .has_active_stream_for_conversation(child_id, ctx)),
+            "startup release did not drain the hydrated child's pending message"
+        );
+        streamer.read(&app, |streamer, ctx| {
+            assert_eq!(
+                streamer.restored_child_state(grandchild_id, ctx),
+                Some(RestoredChildHydration::Unhydrated)
+            );
             assert!(streamer.streams[&child_id].sse_connection.is_some());
+            assert!(streamer.streams[&grandchild_id].wake_connection.is_some());
         });
     });
 }
 
 #[test]
 fn restored_local_child_observer_seed_generation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use crate::ai::ambient_agents::ExecutionLocation;
     use crate::server::server_api::ai::{AgentRunsPage, AgentRunsPageInfo};
 
@@ -144,13 +213,16 @@ fn restored_local_child_observer_seed_generation() {
         let parent = make_parent_task_id_for_test(0xe1);
         let stale = make_parent_task_id_for_test(0xe2);
         let current = make_parent_task_id_for_test(0xe3);
+        let first_requested = Arc::new(AtomicBool::new(false));
         let mut mock = MockAIClient::new();
         let mut sequence = mockall::Sequence::new();
         for id in [stale, current] {
+            let first_requested = first_requested.clone();
             mock.expect_list_agent_runs_page()
                 .times(1)
                 .in_sequence(&mut sequence)
                 .returning(move |_, _| {
+                    first_requested.store(true, Ordering::SeqCst);
                     let mut child = make_ambient_task_with_task_id(id, Some(999));
                     child.parent_run_id = Some(parent.to_string());
                     child.execution_location = Some(ExecutionLocation::Local);
@@ -168,9 +240,15 @@ fn restored_local_child_observer_seed_generation() {
         let streamer = app.add_singleton_model(|ctx| {
             OrchestrationEventStreamer::new_with_clients_for_test(Arc::new(mock), server_api, ctx)
         });
+        let consumer = warpui::EntityId::new();
         streamer.update(&mut app, |streamer, ctx| {
-            let consumer = warpui::EntityId::new();
             streamer.register_viewer_mode_consumer(parent, AIConversationId::new(), consumer, ctx);
+        });
+        crate::test_util::assert_eventually!(
+            first_requested.load(Ordering::SeqCst),
+            "initial Observer request did not start"
+        );
+        streamer.update(&mut app, |streamer, ctx| {
             streamer.unregister_viewer_mode_consumer(parent, consumer);
             streamer.register_viewer_mode_consumer(
                 parent,

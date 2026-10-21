@@ -23,7 +23,7 @@ use crate::terminal::view::load_ai_conversation::{
 
 impl OrchestrationEventStreamer {
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    pub(crate) fn register_restored_child_owner(
+    pub(crate) fn register_restored_child(
         &mut self,
         conversation_id: AIConversationId,
         terminal: &ViewHandle<TerminalView>,
@@ -34,6 +34,38 @@ impl OrchestrationEventStreamer {
             .or_default()
             .restored_owner = Some(terminal.downgrade());
         self.register_consumer(conversation_id, terminal.id(), ctx);
+    }
+
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub(crate) fn release_restored_child_subtree(
+        &mut self,
+        conversation_ids: &[AIConversationId],
+        ctx: &mut ModelContext<Self>,
+    ) {
+        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+            for conversation_id in conversation_ids {
+                let surface = history.terminal_surface_id_for_conversation(conversation_id);
+                let Some(child) = history.conversation_mut(conversation_id) else {
+                    continue;
+                };
+                let was_ready = child.restored_child_execution_ready();
+                child.release_restored_child_startup();
+                if !was_ready
+                    && child.restored_child_execution_ready()
+                    && let Some(surface) = surface
+                {
+                    child.update_status_with_error(
+                        child.status().clone(),
+                        child.status_error().cloned(),
+                        surface,
+                        ctx,
+                    );
+                }
+            }
+        });
+        for conversation_id in conversation_ids {
+            self.reevaluate_eligibility(*conversation_id, ctx);
+        }
     }
     pub(crate) fn restored_child_state(
         &self,
@@ -217,7 +249,11 @@ impl OrchestrationEventStreamer {
                 {
                     return;
                 }
-                let result = result.and_then(|hydrated| {
+                let result = result.and_then(|mut hydrated| {
+                    let current = BlocklistAIHistoryModel::as_ref(ctx)
+                        .conversation(&conversation_id)
+                        .context("install transcript: conversation missing")?;
+                    hydrated.preserve_restored_child_startup(current);
                     let surface = BlocklistAIHistoryModel::as_ref(ctx)
                         .terminal_surface_id_for_conversation(&conversation_id)
                         .context("install transcript: missing terminal surface")?;

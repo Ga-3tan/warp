@@ -1,7 +1,8 @@
 use super::*;
-use crate::ai::ambient_agents::discovery::discover_direct_children;
+use crate::ai::ambient_agents::discovery::{
+    discover_local_child_subtree, needs_restored_local_owner,
+};
 use crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer;
-use crate::pane_group::child_agent::restored_owners::needs_restored_local_owner;
 use crate::server::retry_strategies::is_transient_http_error;
 
 impl AgentDriver {
@@ -40,9 +41,9 @@ impl AgentDriver {
         };
         let group = group.ok_or(AgentDriverError::TerminalUnavailable)?;
         let mut attempt = 0;
-        let children = loop {
-            match discover_direct_children(client.as_ref(), parent_id).await {
-                Ok(children) => break children,
+        let batches = loop {
+            match discover_local_child_subtree(client.as_ref(), parent_id).await {
+                Ok(batches) => break batches,
                 Err(error) if is_transient_http_error(&error) && attempt < 4 => {
                     attempt += 1;
                     log::warn!(
@@ -57,109 +58,141 @@ impl AgentDriver {
                 }
             }
         };
-        for task in children
-            .iter()
-            .filter(|task| needs_restored_local_owner(task))
-        {
-            let task = task.clone();
-            let group = group.clone();
-            let env = env.clone();
-            let (child_id, terminal) = foreground
-                .spawn(move |_, ctx| {
-                    let mut env_vars = (*env).clone();
-                    env_vars.extend(task_env_vars(
-                        Some(&task.task_id),
-                        Some(&parent_id.to_string()),
-                        Harness::Oz,
-                    ));
-                    group.update(ctx, |group, ctx| {
-                        group.prepare_restored_child_owner(
-                            parent_conversation_id,
-                            terminal_id,
-                            &task,
-                            env_vars,
-                            ctx,
-                        )
-                    })
-                })
-                .await?;
-            let result = match terminal {
-                Ok(None) => continue,
-                Ok(Some(terminal)) => {
-                    let terminal_for_bootstrap = terminal.clone();
-                    let driver = foreground
-                        .spawn(move |_, ctx| {
-                            terminal::TerminalDriver::create_from_existing_view(
-                                terminal_for_bootstrap,
+        let mut conversations = HashMap::from([(parent_id, parent_conversation_id)]);
+        let mut restored_children = Vec::new();
+        for batch in batches {
+            let parent_id = batch.parent_task_id;
+            let parent_conversation_id = conversations[&parent_id];
+            for task in batch
+                .children
+                .iter()
+                .filter(|task| needs_restored_local_owner(task))
+            {
+                let task = task.clone();
+                let task_id = task.task_id;
+                let group = group.clone();
+                let env = env.clone();
+                let (child_id, terminal) = foreground
+                    .spawn(move |_, ctx| {
+                        let mut env_vars = (*env).clone();
+                        env_vars.extend(task_env_vars(
+                            Some(&task.task_id),
+                            Some(&parent_id.to_string()),
+                            Harness::Oz,
+                        ));
+                        group.update(ctx, |group, ctx| {
+                            group.prepare_restored_child(
+                                parent_conversation_id,
+                                terminal_id,
+                                &task,
+                                env_vars,
                                 ctx,
                             )
                         })
-                        .await?;
-                    let bootstrap = foreground
-                        .spawn({
-                            let driver = driver.clone();
-                            move |_, ctx| {
-                                driver
-                                    .update(ctx, |driver, _| driver.wait_for_session_bootstrapped())
-                            }
-                        })
-                        .await?;
-                    match bootstrap.await {
-                        Ok(()) => {
-                            let directory = working_dir.to_string_lossy().into_owned();
-                            let cd = foreground
-                                .spawn(move |_, ctx| {
-                                    driver.update(ctx, |driver, ctx| {
-                                        driver.cd_silent(&directory, ctx)
+                    })
+                    .await?;
+                conversations.insert(task_id, child_id);
+                restored_children.push(child_id);
+                let result = match terminal {
+                    Ok(None) => continue,
+                    Ok(Some(terminal)) => {
+                        let terminal_for_bootstrap = terminal.clone();
+                        let driver = foreground
+                            .spawn(move |_, ctx| {
+                                terminal::TerminalDriver::create_from_existing_view(
+                                    terminal_for_bootstrap,
+                                    ctx,
+                                )
+                            })
+                            .await?;
+                        let bootstrap = foreground
+                            .spawn({
+                                let driver = driver.clone();
+                                move |_, ctx| {
+                                    driver.update(ctx, |driver, _| {
+                                        driver.wait_for_session_bootstrapped()
                                     })
-                                })
-                                .await?;
-                            match cd.await {
-                                Ok(output)
-                                    if output
-                                        .exit_code
-                                        .is_some_and(|code| code.was_successful()) =>
-                                {
-                                    Ok(terminal)
                                 }
-                                Ok(output) => Err(anyhow!(
-                                    "owner shell directory setup failed: {:?}",
-                                    output.exit_code
-                                )),
-                                Err(error) => Err(anyhow!(error)),
+                            })
+                            .await?;
+                        match bootstrap.await {
+                            Ok(()) => {
+                                let directory = working_dir.to_string_lossy().into_owned();
+                                let cd = foreground
+                                    .spawn(move |_, ctx| {
+                                        driver.update(ctx, |driver, ctx| {
+                                            driver.cd_silent(&directory, ctx)
+                                        })
+                                    })
+                                    .await?;
+                                match cd.await {
+                                    Ok(output)
+                                        if output
+                                            .exit_code
+                                            .is_some_and(|code| code.was_successful()) =>
+                                    {
+                                        Ok(terminal)
+                                    }
+                                    Ok(output) => Err(anyhow!(
+                                        "owner shell directory setup failed: {:?}",
+                                        output.exit_code
+                                    )),
+                                    Err(error) => Err(anyhow!(error)),
+                                }
                             }
+                            Err(error) => Err(anyhow!("owner shell bootstrap: {error}")),
                         }
-                        Err(error) => Err(anyhow!("owner shell bootstrap: {error}")),
                     }
-                }
-                Err(error) => Err(error),
-            };
+                    Err(error) => Err(error),
+                };
+                foreground
+                    .spawn(move |_, ctx| {
+                        OrchestrationEventStreamer::handle(ctx).update(ctx, |streamer, ctx| {
+                            match result {
+                                Ok(terminal) => {
+                                    streamer.register_restored_child(child_id, &terminal, ctx)
+                                }
+                                Err(error) => streamer.fail_restored_child(
+                                    child_id,
+                                    format!("{error:#}"),
+                                    ctx,
+                                ),
+                            }
+                        });
+                    })
+                    .await?;
+            }
             foreground
-                .spawn(move |_, ctx| {
-                    OrchestrationEventStreamer::handle(ctx).update(
-                        ctx,
-                        |streamer, ctx| match result {
-                            Ok(terminal) => {
-                                streamer.register_restored_child_owner(child_id, &terminal, ctx)
+                .spawn({
+                    let group = group.clone();
+                    move |_, ctx| {
+                        OrchestrationEventStreamer::handle(ctx).update(ctx, |streamer, ctx| {
+                            for task in &batch.children {
+                                streamer.register_watched_run_id(
+                                    parent_conversation_id,
+                                    task.task_id.to_string(),
+                                    ctx,
+                                );
                             }
-                            Err(error) => {
-                                streamer.fail_restored_child(child_id, format!("{error:#}"), ctx)
-                            }
-                        },
-                    );
+                        });
+                        group.update(ctx, |group, ctx| {
+                            group.finish_restored_child_owners(
+                                parent_conversation_id,
+                                terminal_id,
+                                &batch.children,
+                                ctx,
+                            )
+                        });
+                    }
                 })
                 .await?;
         }
         foreground
             .spawn(move |_, ctx| {
-                group.update(ctx, |group, ctx| {
-                    group.finish_restored_child_owners(
-                        parent_conversation_id,
-                        terminal_id,
-                        &children,
-                        ctx,
-                    )
+                OrchestrationEventStreamer::handle(ctx).update(ctx, |streamer, ctx| {
+                    streamer.release_restored_child_subtree(&restored_children, ctx);
                 });
+                group.update(ctx, |group, ctx| group.release_headless_child_seed(ctx));
             })
             .await?;
         Ok(())
