@@ -105,9 +105,7 @@ fn discover(
     } else {
         let mut selected = None;
         for dir in path_dirs.iter().filter(|dir| dir.is_absolute()) {
-            let candidate = dir
-                .join(format!("{harness}-cli-sidecar"))
-                .join(MANIFEST_FILE);
+            let candidate = dir.join(format!("warp-harness.{harness}.json"));
             if candidate
                 .try_exists()
                 .with_context(|| format!("Cannot inspect {}", candidate.display()))?

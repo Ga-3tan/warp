@@ -33,12 +33,12 @@ fn native_manifests_resolve_paths_after_relocation_without_rewriting_literal_arg
     let root = tempdir().unwrap();
     let original = root.path().join("original");
     let relocated = root.path().join("relocated package with spaces");
-    let sidecar = original.join("pi-cli-sidecar");
+    let sidecar = &original;
     let node = format!("runtime/{PROGRAM}");
     write_executable(&sidecar.join(&node));
     fs::write(sidecar.join("adapter.js"), "").unwrap();
     fs::write(
-        sidecar.join(MANIFEST_FILE),
+        sidecar.join("warp-harness.pi.json"),
         json!({
             "schema_version": 1,
             "harness": "pi",
@@ -60,12 +60,12 @@ fn native_manifests_resolve_paths_after_relocation_without_rewriting_literal_arg
     .unwrap();
     assert_eq!(
         Path::new(&selected.launch.program),
-        fs::canonicalize(relocated.join("pi-cli-sidecar").join(node)).unwrap()
+        fs::canonicalize(relocated.join(node)).unwrap()
     );
     assert_eq!(
         selected.launch.args,
         [
-            fs::canonicalize(relocated.join("pi-cli-sidecar/adapter.js"))
+            fs::canonicalize(relocated.join("adapter.js"))
                 .unwrap()
                 .to_str()
                 .unwrap(),
@@ -82,13 +82,13 @@ fn native_discovery_preserves_override_mount_and_path_order_and_fails_closed() {
     let override_dir = root.path().join("override");
     let path_dirs = [root.path().join("first"), root.path().join("second")];
     let mount = mounts.join("pi-cli-sidecar");
-    for (dir, arg) in [
-        (&override_dir, "override"),
-        (&mount, "mount"),
-        (&path_dirs[0].join("pi-cli-sidecar"), "first"),
-        (&path_dirs[1].join("pi-cli-sidecar"), "second"),
+    for (dir, name, arg) in [
+        (&override_dir, MANIFEST_FILE, "override"),
+        (&mount, MANIFEST_FILE, "mount"),
+        (&path_dirs[0], "warp-harness.pi.json", "first"),
+        (&path_dirs[1], "warp-harness.pi.json", "second"),
     ] {
-        write_manifest(&dir.join(MANIFEST_FILE), &[arg]);
+        write_manifest(&dir.join(name), &[arg]);
         write_executable(&dir.join("usr/local/bin").join(PROGRAM));
     }
     assert_eq!(
@@ -113,11 +113,7 @@ fn native_discovery_preserves_override_mount_and_path_order_and_fails_closed() {
             .args,
         ["first"]
     );
-    fs::write(
-        path_dirs[0].join("pi-cli-sidecar").join(MANIFEST_FILE),
-        "invalid",
-    )
-    .unwrap();
+    fs::write(path_dirs[0].join("warp-harness.pi.json"), "invalid").unwrap();
     assert!(discover(Harness::Pi, None, &mounts, &path_dirs).is_err());
 }
 
