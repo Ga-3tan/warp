@@ -28,9 +28,10 @@ impl PaneGroup {
         prepared: &AIConversation,
         ctx: &mut ViewContext<Self>,
     ) {
+        // Installation and acknowledgement are synchronous, so queued duplicates see an invalid token.
         if installation.target.pane_group_id != ctx.view_id()
-            || !streamer.update(ctx, |streamer, ctx| {
-                streamer.begin_local_child_history_installation(installation, ctx)
+            || !streamer.read(ctx, |streamer, ctx| {
+                streamer.is_current_local_child_history_installation(installation, ctx)
             })
         {
             return;
@@ -113,15 +114,7 @@ impl PaneGroup {
             .map_or(parent_terminal_id, |terminal| terminal.id());
         let existing = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation_id_for_agent_id(&task.task_id.to_string());
-        let child_id = existing
-            .or_else(|| {
-                self.restored_local_descendant_conversations
-                    .get(&task.task_id)
-                    .copied()
-            })
-            .unwrap_or_else(AIConversationId::new);
-        self.restored_local_descendant_conversations
-            .insert(task.task_id, child_id);
+        let child_id = existing.unwrap_or_else(AIConversationId::new);
         let result = (|| {
             if BlocklistAIHistoryModel::as_ref(ctx)
                 .conversation(&child_id)

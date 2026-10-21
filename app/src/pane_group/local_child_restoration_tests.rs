@@ -188,6 +188,7 @@ fn restored_local_child_installation_acknowledgement_and_duplicate_delivery() {
 
 #[test]
 fn restored_local_child_subtree_startup_gate() {
+    assert!(AIConversation::new(false, false).is_local_child_execution_ready());
     App::test((), |mut app| async move {
         let fixture = prepare_local_child(&mut app);
         assert_eventually!(
@@ -437,9 +438,4 @@ fn restored_local_child_owner_replacement_invalidates_prepared_history() {
             assert!(!child.is_local_child_execution_ready());
         });
     });
-}
-
-#[test]
-fn ordinary_conversations_pass_the_local_child_execution_gate() {
-    assert!(AIConversation::new(false, false).is_local_child_execution_ready());
 }

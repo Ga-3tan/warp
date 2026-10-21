@@ -98,22 +98,16 @@ impl AgentDriver {
                     Ok(None) => continue,
                     Ok(Some(terminal)) => {
                         let terminal_for_bootstrap = terminal.clone();
-                        let driver = foreground
+                        let (driver, bootstrap) = foreground
                             .spawn(move |_, ctx| {
-                                terminal::TerminalDriver::create_from_existing_view(
+                                let driver = terminal::TerminalDriver::create_from_existing_view(
                                     terminal_for_bootstrap,
                                     ctx,
-                                )
-                            })
-                            .await?;
-                        let bootstrap = foreground
-                            .spawn({
-                                let driver = driver.clone();
-                                move |_, ctx| {
-                                    driver.update(ctx, |driver, _| {
-                                        driver.wait_for_session_bootstrapped()
-                                    })
-                                }
+                                );
+                                let bootstrap = driver.update(ctx, |driver, _| {
+                                    driver.wait_for_session_bootstrapped()
+                                });
+                                (driver, bootstrap)
                             })
                             .await?;
                         match bootstrap.await {

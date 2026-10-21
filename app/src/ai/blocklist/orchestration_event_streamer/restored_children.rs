@@ -36,7 +36,6 @@ impl OrchestrationEventStreamer {
         if let Some(previous) = previous.filter(|previous| *previous != target) {
             stream.consumers.remove(&previous.terminal_id);
             stream.local_child_restoration_generation = None;
-            stream.local_child_history_installation_claimed = false;
             if self.local_child_restoration_status(conversation_id, ctx)
                 == Some(LocalChildRestorationStatus::Restoring)
             {
@@ -218,10 +217,6 @@ impl OrchestrationEventStreamer {
             .entry(conversation_id)
             .or_default()
             .local_child_restoration_generation = Some(generation);
-        self.streams
-            .entry(conversation_id)
-            .or_default()
-            .local_child_history_installation_claimed = false;
         ctx.spawn(
             async move {
                 let (data, metadata) = client
@@ -313,7 +308,7 @@ impl OrchestrationEventStreamer {
         true
     }
 
-    fn is_current_local_child_history_installation(
+    pub(crate) fn is_current_local_child_history_installation(
         &self,
         installation: LocalChildHistoryInstallation,
         ctx: &AppContext,
@@ -328,32 +323,13 @@ impl OrchestrationEventStreamer {
                         && stream.local_child_restoration_target == Some(installation.target)
                 })
     }
-
-    pub(crate) fn begin_local_child_history_installation(
-        &mut self,
-        installation: LocalChildHistoryInstallation,
-        ctx: &AppContext,
-    ) -> bool {
-        if !self.is_current_local_child_history_installation(installation, ctx) {
-            return false;
-        }
-        let stream = self.streams.get_mut(&installation.conversation_id).unwrap();
-        if stream.local_child_history_installation_claimed {
-            return false;
-        }
-        stream.local_child_history_installation_claimed = true;
-        true
-    }
-
     pub(crate) fn acknowledge_local_child_history_installation(
         &mut self,
         installation: LocalChildHistoryInstallation,
         result: anyhow::Result<()>,
         ctx: &mut ModelContext<Self>,
     ) {
-        if !self.is_current_local_child_history_installation(installation, ctx)
-            || !self.streams[&installation.conversation_id].local_child_history_installation_claimed
-        {
+        if !self.is_current_local_child_history_installation(installation, ctx) {
             return;
         }
         let conversation_id = installation.conversation_id;
@@ -408,7 +384,6 @@ impl OrchestrationEventStreamer {
     ) {
         if let Some(stream) = self.streams.get_mut(&conversation_id) {
             stream.local_child_restoration_generation = None;
-            stream.local_child_history_installation_claimed = false;
         }
         let Some(task_id) = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)

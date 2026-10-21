@@ -205,7 +205,6 @@ impl AgentEventConsumer for SseForwardingConsumer {
 struct ConversationStreamState {
     local_child_restoration_target: Option<LocalChildRestorationTarget>,
     local_child_restoration_generation: Option<Uuid>,
-    local_child_history_installation_claimed: bool,
     /// Run IDs the SSE filter watches for this conversation. When the
     /// conversation has any orchestration role, this contains its own
     /// `self_run_id` (its inbox — used both for parent→child traffic on
@@ -1365,14 +1364,7 @@ impl OrchestrationEventStreamer {
         ctx.spawn(
             async move { list_direct_children(ai_client.as_ref(), parent_task_id).await },
             move |me, result, ctx| {
-                if me
-                    .viewer_mode_orchestrators
-                    .get(&parent_task_id)
-                    .is_none_or(|entry| entry.seed_generation != Some(generation))
-                {
-                    return;
-                }
-                me.finish_ancestor_seed_fetch(parent_task_id, result, ctx);
+                me.finish_ancestor_seed_fetch(parent_task_id, generation, result, ctx);
             },
         );
     }
@@ -1381,6 +1373,7 @@ impl OrchestrationEventStreamer {
     fn finish_ancestor_seed_fetch(
         &mut self,
         parent_task_id: AmbientAgentTaskId,
+        generation: Uuid,
         result: anyhow::Result<Vec<crate::ai::ambient_agents::task::AmbientAgentTask>>,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -1391,6 +1384,9 @@ impl OrchestrationEventStreamer {
             );
             return;
         };
+        if entry.seed_generation != Some(generation) {
+            return;
+        }
         entry.seed_fetch_in_flight = false;
         match result {
             Ok(tasks) => {

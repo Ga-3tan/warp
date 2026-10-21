@@ -939,8 +939,6 @@ pub struct PaneGroup {
     pending_parent_child_seeds: HashMap<AmbientAgentTaskId, PendingParentChildSeed>,
 
     passive_child_seeding_released: bool,
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    restored_local_descendant_conversations: HashMap<AmbientAgentTaskId, AIConversationId>,
 
     /// Test-only: counts `spawn_ancestor_list_fetch_if_needed` dispatches, so
     /// tests can assert that a burst of `TasksUpdated` re-drives coalesces
@@ -3215,7 +3213,6 @@ impl PaneGroup {
             pending_parent_child_seeds: HashMap::new(),
             passive_child_seeding_released: !FeatureFlag::RestoreLocalSubtree.is_enabled()
                 || !warp_core::execution_mode::AppExecutionMode::as_ref(ctx).is_autonomous(),
-            restored_local_descendant_conversations: HashMap::new(),
             #[cfg(test)]
             parent_child_seed_fetch_dispatch_count: 0,
             failed_viewer_child_sessions: HashMap::new(),

@@ -95,6 +95,14 @@ fn restored_local_child_subtree_discovery() {
         [9999, 2, 6, 8].map(|id| uuid::Uuid::from_u128(id).to_string())
     );
     assert_eq!(batches[0].children.len(), 5);
+    assert_eq!(
+        batches[0]
+            .children
+            .iter()
+            .map(|child| child.task_id.to_string())
+            .collect::<Vec<_>>(),
+        [2, 3, 4, 5, 6].map(|id| uuid::Uuid::from_u128(id).to_string())
+    );
     assert_eq!(batches[1].children.len(), 1);
     assert_eq!(
         batches[1].children[0].parent_run_id,
@@ -290,28 +298,5 @@ fn restored_local_child_strict_page_decoder() {
         json!({"runs": [], "page_info": {"next_cursor": "next"}}),
     ] {
         assert!(serde_json::from_value::<AgentRunsPage>(response).is_err());
-    }
-}
-
-#[test]
-fn restored_local_child_classification() {
-    for (location, harness, expected) in [
-        ("LOCAL", None, true),
-        ("LOCAL", Some("oz"), true),
-        ("REMOTE", None, false),
-        ("LOCAL", Some("claude"), false),
-        ("LOCAL", Some("unknown-future-harness"), false),
-    ] {
-        let mut row = run(2);
-        row["execution_location"] = json!(location);
-        if let Some(harness) = harness {
-            row["agent_config_snapshot"] = json!({"harness": {"type": harness}});
-        }
-        let task: AmbientAgentTask = serde_json::from_value(row).unwrap();
-        assert_eq!(
-            is_native_local_run(&task),
-            expected,
-            "{location} {harness:?}"
-        );
     }
 }

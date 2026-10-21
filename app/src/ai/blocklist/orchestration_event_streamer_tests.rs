@@ -53,39 +53,14 @@ fn sse_backoff_escalates_then_caps() {
 
 #[test]
 fn restored_local_child_observer_seed_generation() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use crate::ai::ambient_agents::ExecutionLocation;
-    use crate::server::server_api::ai::{AgentRunsPage, AgentRunsPageInfo};
-
     App::test((), |mut app| async move {
         app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
         let parent = make_parent_task_id_for_test(0xe1);
         let stale = make_parent_task_id_for_test(0xe2);
         let current = make_parent_task_id_for_test(0xe3);
-        let first_requested = Arc::new(AtomicBool::new(false));
         let mut mock = MockAIClient::new();
-        let mut sequence = mockall::Sequence::new();
-        for id in [stale, current] {
-            let first_requested = first_requested.clone();
-            mock.expect_list_agent_runs_page()
-                .times(1)
-                .in_sequence(&mut sequence)
-                .returning(move |_, _| {
-                    first_requested.store(true, Ordering::SeqCst);
-                    let mut child = make_ambient_task_with_task_id(id, Some(999));
-                    child.parent_run_id = Some(parent.to_string());
-                    child.execution_location = Some(ExecutionLocation::Local);
-                    Ok(AgentRunsPage {
-                        runs: vec![child],
-                        harness_names: Vec::new(),
-                        page_info: AgentRunsPageInfo {
-                            has_next_page: false,
-                            next_cursor: None,
-                        },
-                    })
-                });
-        }
+        mock.expect_list_agent_runs_page()
+            .returning(|_, _| Err(anyhow!("completion is supplied at the production boundary")));
         let server_api = ServerApiProvider::new_for_test().get();
         let streamer = app.add_singleton_model(|ctx| {
             OrchestrationEventStreamer::new_with_clients_for_test(Arc::new(mock), server_api, ctx)
@@ -93,12 +68,9 @@ fn restored_local_child_observer_seed_generation() {
         let consumer = warpui::EntityId::new();
         streamer.update(&mut app, |streamer, ctx| {
             streamer.register_viewer_mode_consumer(parent, AIConversationId::new(), consumer, ctx);
-        });
-        crate::test_util::assert_eventually!(
-            first_requested.load(Ordering::SeqCst),
-            "initial Observer request did not start"
-        );
-        streamer.update(&mut app, |streamer, ctx| {
+            let old_generation = streamer.viewer_mode_orchestrators[&parent]
+                .seed_generation
+                .unwrap();
             streamer.unregister_viewer_mode_consumer(parent, consumer);
             streamer.register_viewer_mode_consumer(
                 parent,
@@ -108,17 +80,34 @@ fn restored_local_child_observer_seed_generation() {
             );
             let entry = streamer.viewer_mode_orchestrators.get_mut(&parent).unwrap();
             entry.event_cursor = 37;
+            let generation = entry.seed_generation.unwrap();
+            assert_ne!(generation, old_generation);
             assert!(!entry.seeded);
             assert!(entry.sse_connection.is_none());
-        });
-        crate::test_util::assert_eventually!(
-            streamer.read(&app, |streamer, _| streamer.viewer_mode_orchestrators
-                [&parent]
-                .seeded),
-            "new Observer generation did not seed"
-        );
-        streamer.read(&app, |streamer, _| {
+
+            streamer.finish_ancestor_seed_fetch(
+                parent,
+                old_generation,
+                Ok(vec![make_ambient_task_with_task_id(stale, Some(999))]),
+                ctx,
+            );
             let entry = &streamer.viewer_mode_orchestrators[&parent];
+            assert!(!entry.seeded);
+            assert!(entry.seed_fetch_in_flight);
+            assert!(entry.sse_connection.is_none());
+            assert!(entry.known_children.is_empty());
+            assert_eq!(entry.event_cursor, 37);
+            assert_eq!(entry.seed_generation, Some(generation));
+
+            streamer.finish_ancestor_seed_fetch(
+                parent,
+                generation,
+                Ok(vec![make_ambient_task_with_task_id(current, Some(999))]),
+                ctx,
+            );
+            let entry = &streamer.viewer_mode_orchestrators[&parent];
+            assert!(entry.seeded);
+            assert!(!entry.seed_fetch_in_flight);
             assert_eq!(entry.known_children, HashSet::from([current.to_string()]));
             assert_eq!(entry.event_cursor, 37);
             assert!(entry.sse_connection.is_some());
@@ -2468,6 +2457,9 @@ fn finish_ancestor_seed_fetch_emits_child_spawned_for_each_seeded_child() {
         streamer.update(&mut app, |me, ctx| {
             me.finish_ancestor_seed_fetch(
                 parent_task_id,
+                me.viewer_mode_orchestrators[&parent_task_id]
+                    .seed_generation
+                    .unwrap(),
                 Ok(vec![
                     make_ambient_task_with_task_id(parent_task_id, Some(5)),
                     make_ambient_task_with_task_id(child_a, Some(11)),
@@ -2530,22 +2522,26 @@ fn repeated_ancestor_seed_results_do_not_rebroadcast_known_children() {
         });
         let parent_task_id = make_parent_task_id_for_test(0xd4);
         let child_task_id = make_parent_task_id_for_test(0xd5);
+        let generation = Uuid::new_v4();
         streamer.update(&mut app, |streamer, _| {
             streamer
                 .viewer_mode_orchestrators
                 .entry(parent_task_id)
-                .or_default();
+                .or_default()
+                .seed_generation = Some(generation);
         });
         let captured_spawns = capture_child_spawns(&mut app, &streamer);
 
         streamer.update(&mut app, |streamer, ctx| {
             streamer.finish_ancestor_seed_fetch(
                 parent_task_id,
+                generation,
                 Ok(vec![make_ambient_task_with_task_id(child_task_id, None)]),
                 ctx,
             );
             streamer.finish_ancestor_seed_fetch(
                 parent_task_id,
+                generation,
                 Ok(vec![make_ambient_task_with_task_id(child_task_id, None)]),
                 ctx,
             );
@@ -2588,6 +2584,9 @@ fn register_viewer_mode_consumer_replays_known_children_for_later_panes() {
             me.register_viewer_mode_consumer(parent_task_id, placeholder_a, consumer_a, ctx);
             me.finish_ancestor_seed_fetch(
                 parent_task_id,
+                me.viewer_mode_orchestrators[&parent_task_id]
+                    .seed_generation
+                    .unwrap(),
                 Ok(vec![make_ambient_task_with_task_id(child_a, Some(3))]),
                 ctx,
             );

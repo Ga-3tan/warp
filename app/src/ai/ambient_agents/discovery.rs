@@ -10,76 +10,11 @@ pub async fn list_direct_children(
     ai_client: &dyn AIClient,
     parent_task_id: AmbientAgentTaskId,
 ) -> anyhow::Result<Vec<AmbientAgentTask>> {
-    Ok(list_direct_children_with_harness(ai_client, parent_task_id)
-        .await?
-        .into_iter()
-        .map(|(task, _)| task)
-        .collect())
-}
-
-pub(crate) fn is_native_local_run(task: &AmbientAgentTask) -> bool {
-    task.execution_location == Some(ExecutionLocation::Local) && !task.is_third_party_harness()
-}
-
-#[cfg_attr(target_family = "wasm", allow(dead_code))]
-pub(crate) struct ChildRunBatch {
-    pub parent_task_id: AmbientAgentTaskId,
-    pub children: Vec<AmbientAgentTask>,
-}
-
-#[cfg_attr(target_family = "wasm", allow(dead_code))]
-pub(crate) async fn list_local_subtree(
-    ai_client: &dyn AIClient,
-    root_task_id: AmbientAgentTaskId,
-) -> anyhow::Result<Vec<ChildRunBatch>> {
-    let mut parents = VecDeque::from([root_task_id]);
-    let mut identities = HashMap::new();
-    let mut batches = Vec::new();
-    while let Some(parent_task_id) = parents.pop_front() {
-        let rows = list_direct_children_with_harness(ai_client, parent_task_id).await?;
-        let mut children = Vec::new();
-        for (child, harness) in rows {
-            anyhow::ensure!(
-                child.task_id != root_task_id,
-                "root run returned as a descendant"
-            );
-            let identity = (
-                child.parent_run_id.clone(),
-                child.execution_location,
-                harness,
-            );
-            if let Some(prior) = identities.get(&child.task_id) {
-                anyhow::ensure!(
-                    prior == &identity,
-                    "conflicting subtree child {}",
-                    child.task_id
-                );
-                continue;
-            }
-            identities.insert(child.task_id, identity);
-            if is_native_local_run(&child) {
-                parents.push_back(child.task_id);
-            }
-            children.push(child);
-        }
-        batches.push(ChildRunBatch {
-            parent_task_id,
-            children,
-        });
-    }
-    Ok(batches)
-}
-
-async fn list_direct_children_with_harness(
-    ai_client: &dyn AIClient,
-    parent_task_id: AmbientAgentTaskId,
-) -> anyhow::Result<Vec<(AmbientAgentTask, Option<String>)>> {
     let parent_id = parent_task_id.to_string();
     let mut cursor = None;
     let mut cursors = HashSet::new();
-    let mut children: Vec<AmbientAgentTask> = Vec::new();
-    let mut indices = HashMap::new();
-    let mut harness_names = Vec::new();
+    let mut children: Vec<(AmbientAgentTask, Option<String>)> = Vec::new();
+    let mut indices = HashMap::<AmbientAgentTaskId, usize>::new();
     loop {
         let page = ai_client
             .list_agent_runs_page(
@@ -112,21 +47,20 @@ async fn list_direct_children_with_harness(
                     .map(|harness| harness.harness_type.config_name().to_owned())
             });
             if let Some(&index) = indices.get(&child.task_id) {
-                let prior: &AmbientAgentTask = &children[index];
+                let (prior, prior_harness) = &children[index];
                 if prior.parent_run_id != child.parent_run_id
                     || prior.execution_location != child.execution_location
-                    || harness_names[index] != harness_name
+                    || *prior_harness != harness_name
                 {
                     bail!("conflicting duplicate child {}", child.task_id);
                 }
             } else {
                 indices.insert(child.task_id, children.len());
-                children.push(child);
-                harness_names.push(harness_name);
+                children.push((child, harness_name));
             }
         }
         if !page.page_info.has_next_page {
-            return Ok(children.into_iter().zip(harness_names).collect());
+            return Ok(children.into_iter().map(|(task, _)| task).collect());
         }
         let next = page
             .page_info
@@ -138,6 +72,44 @@ async fn list_direct_children_with_harness(
         }
         cursor = Some(next);
     }
+}
+
+pub(crate) fn is_native_local_run(task: &AmbientAgentTask) -> bool {
+    task.execution_location == Some(ExecutionLocation::Local) && !task.is_third_party_harness()
+}
+
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+pub(crate) struct ChildRunBatch {
+    pub parent_task_id: AmbientAgentTaskId,
+    pub children: Vec<AmbientAgentTask>,
+}
+
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+pub(crate) async fn list_local_subtree(
+    ai_client: &dyn AIClient,
+    root_task_id: AmbientAgentTaskId,
+) -> anyhow::Result<Vec<ChildRunBatch>> {
+    let mut parents = VecDeque::from([root_task_id]);
+    let mut seen = HashSet::from([root_task_id]);
+    let mut batches = Vec::new();
+    while let Some(parent_task_id) = parents.pop_front() {
+        let children = list_direct_children(ai_client, parent_task_id).await?;
+        for child in &children {
+            anyhow::ensure!(
+                seen.insert(child.task_id),
+                "run {} appears under multiple parents or forms a cycle",
+                child.task_id
+            );
+            if is_native_local_run(child) {
+                parents.push_back(child.task_id);
+            }
+        }
+        batches.push(ChildRunBatch {
+            parent_task_id,
+            children,
+        });
+    }
+    Ok(batches)
 }
 
 #[cfg(test)]

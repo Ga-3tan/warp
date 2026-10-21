@@ -187,45 +187,8 @@ fn restored_local_child_placeholder_promotion_is_idempotent() {
 }
 
 #[test]
-fn restored_local_child_owner_setup_error_is_not_retried() {
-    use crate::ai::agent::conversation::LocalChildRestorationStatus;
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-        let panes = mock_pane_group(&mut app, Default::default());
-        panes.update(&mut app, |panes, ctx| {
-            let parent_pane = panes.focused_pane_id(ctx);
-            let terminal = panes.terminal_view_from_pane_id(parent_pane, ctx).unwrap();
-            let parent_id = start_parent_conversation(panes, parent_pane, ctx);
-            let mut task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
-            let (child_id, result) = panes.prepare_restored_local_child(
-                parent_id,
-                terminal.id(),
-                &task,
-                HashMap::new(),
-                ctx,
-            );
-            assert!(result.is_err());
-            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
-                let child = history.conversation_mut(&child_id).unwrap();
-                assert_eq!(child.task_id(), Some(task.task_id));
-                child.set_local_child_restoration_status(LocalChildRestorationStatus::Error);
-            });
-            task.conversation_id = Some("later-token".into());
-            let (_, result) = panes.prepare_restored_local_child(
-                parent_id,
-                terminal.id(),
-                &task,
-                HashMap::new(),
-                ctx,
-            );
-            assert!(result.unwrap().is_none());
-            assert!(!panes.child_agent_panes.contains_key(&child_id));
-        });
-    });
-}
-
-#[test]
-fn restored_local_child_deferred_seed_after_hydration() {
+fn restored_local_child_deferred_seed_preserves_execution_state() {
+    use crate::ai::agent::RenderableAIError;
     use crate::ai::agent::conversation::LocalChildRestorationStatus;
 
     App::test((), |mut app| async move {
@@ -236,122 +199,118 @@ fn restored_local_child_deferred_seed_after_hydration() {
             let parent_terminal = panes.terminal_view_from_pane_id(parent_pane, ctx).unwrap();
             let parent_id = start_parent_conversation(panes, parent_pane, ctx);
             let parent_run = new_ambient_agent_task_id();
-            let mut task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
-            task.conversation_id = Some("child-token".into());
-            let (child_id, terminal) = panes.prepare_restored_local_child(
+            let mut busy_task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            busy_task.conversation_id = Some("child-token".into());
+            let (busy_id, terminal) = panes.prepare_restored_local_child(
                 parent_id,
                 parent_terminal.id(),
-                &task,
+                &busy_task,
                 HashMap::new(),
                 ctx,
             );
             let terminal = terminal.unwrap().unwrap();
-            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                history
-                    .conversation_mut(&child_id)
-                    .unwrap()
-                    .set_local_child_restoration_status(LocalChildRestorationStatus::Restored);
-                history.update_conversation_status(
-                    terminal.id(),
-                    child_id,
-                    ConversationStatus::InProgress,
-                    ctx,
-                );
-            });
-            AgentConversationsModel::handle(ctx).update(ctx, |model, _| {
-                model.insert_task_for_test(task.clone());
-            });
-
-            panes.finish_seed_child_conversations_from_task(
+            let failed_task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            let (failed_id, result) = panes.prepare_restored_local_child(
                 parent_id,
-                parent_run,
-                Ok(vec![task]),
-                ctx,
-            );
-
-            let history = BlocklistAIHistoryModel::as_ref(ctx);
-            let child = history.conversation(&child_id).unwrap();
-            assert_eq!(child.status(), &ConversationStatus::InProgress);
-            assert_eq!(
-                child.local_child_restoration_status(),
-                Some(LocalChildRestorationStatus::Restored)
-            );
-            assert_eq!(
-                history.terminal_surface_id_for_conversation(&child_id),
-                Some(terminal.id())
-            );
-            assert_eq!(child.parent_conversation_id(), Some(parent_id));
-        });
-    });
-}
-
-#[test]
-fn restored_local_child_deferred_seed_after_failure() {
-    use crate::ai::agent::RenderableAIError;
-    use crate::ai::agent::conversation::LocalChildRestorationStatus;
-
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-        let panes = mock_pane_group(&mut app, Default::default());
-        panes.update(&mut app, |panes, ctx| {
-            let parent_pane = panes.focused_pane_id(ctx);
-            let terminal = panes.terminal_view_from_pane_id(parent_pane, ctx).unwrap();
-            let parent_id = start_parent_conversation(panes, parent_pane, ctx);
-            let parent_run = new_ambient_agent_task_id();
-            let task = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
-            let sibling = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
-            let (child_id, result) = panes.prepare_restored_local_child(
-                parent_id,
-                terminal.id(),
-                &task,
+                parent_terminal.id(),
+                &failed_task,
                 HashMap::new(),
                 ctx,
             );
             assert!(result.is_err());
+            let mut sibling = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            sibling.state = AmbientAgentTaskState::InProgress;
+            let sibling_id = restore_remote_child_conversation(
+                panes,
+                parent_pane,
+                parent_id,
+                sibling.task_id,
+                ctx,
+            );
+            let previous_update = chrono::DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+            sibling.updated_at = chrono::DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
             BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                let child = history.conversation_mut(&child_id).unwrap();
-                child.set_local_child_restoration_status(LocalChildRestorationStatus::Error);
-                child.update_status_with_error(
+                history
+                    .conversation_mut(&busy_id)
+                    .unwrap()
+                    .set_local_child_restoration_status(LocalChildRestorationStatus::Restored);
+                history.update_conversation_status(
+                    terminal.id(),
+                    busy_id,
+                    ConversationStatus::InProgress,
+                    ctx,
+                );
+                let failed = history.conversation_mut(&failed_id).unwrap();
+                failed.set_local_child_restoration_status(LocalChildRestorationStatus::Error);
+                failed.update_status_with_error(
                     ConversationStatus::Error,
                     Some(RenderableAIError::other("missing token", false)),
-                    terminal.id(),
+                    parent_terminal.id(),
+                    ctx,
+                );
+                history
+                    .conversation_mut(&sibling_id)
+                    .unwrap()
+                    .set_remote_run_updated_at(previous_update.with_timezone(&chrono::Local));
+                history.update_conversation_status(
+                    parent_terminal.id(),
+                    sibling_id,
+                    ConversationStatus::Success,
                     ctx,
                 );
             });
             AgentConversationsModel::handle(ctx).update(ctx, |model, _| {
-                model.insert_task_for_test(task.clone());
+                model.insert_task_for_test(busy_task.clone());
+                model.insert_task_for_test(failed_task.clone());
                 model.insert_task_for_test(sibling.clone());
             });
 
             panes.finish_seed_child_conversations_from_task(
                 parent_id,
                 parent_run,
-                Ok(vec![task, sibling.clone()]),
+                Ok(vec![busy_task, failed_task, sibling.clone()]),
                 ctx,
             );
 
             let history = BlocklistAIHistoryModel::as_ref(ctx);
-            let child = history.conversation(&child_id).unwrap();
-            assert_eq!(child.status(), &ConversationStatus::Error);
+            let busy = history.conversation(&busy_id).unwrap();
+            assert_eq!(busy.status(), &ConversationStatus::InProgress);
             assert_eq!(
-                child.status_error_message().as_deref(),
+                busy.local_child_restoration_status(),
+                Some(LocalChildRestorationStatus::Restored)
+            );
+            assert_eq!(
+                history.terminal_surface_id_for_conversation(&busy_id),
+                Some(terminal.id())
+            );
+            assert_eq!(busy.parent_conversation_id(), Some(parent_id));
+            let failed = history.conversation(&failed_id).unwrap();
+            assert_eq!(failed.status(), &ConversationStatus::Error);
+            assert_eq!(
+                failed.status_error_message().as_deref(),
                 Some("missing token")
             );
             assert_eq!(
-                child.local_child_restoration_status(),
+                failed.local_child_restoration_status(),
                 Some(LocalChildRestorationStatus::Error)
             );
-            let sibling_id = history
-                .conversation_id_for_agent_id(&sibling.task_id.to_string())
-                .unwrap();
-            assert!(history.conversation(&sibling_id).unwrap().is_remote_child());
+            assert!(!failed.is_local_child_execution_ready());
+            assert_eq!(failed.parent_conversation_id(), Some(parent_id));
+            let passive = history.conversation(&sibling_id).unwrap();
+            assert!(passive.is_remote_child());
+            assert_eq!(passive.status(), &ConversationStatus::InProgress);
             assert_eq!(
-                history.conversation(&sibling_id).unwrap().status(),
-                &ConversationStatus::Success
+                passive.remote_run_updated_at(),
+                Some(sibling.updated_at.with_timezone(&chrono::Local))
             );
         });
     });
 }
+
 #[test]
 fn restored_local_child_subtree_setup_failure() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -389,7 +348,7 @@ fn restored_local_child_subtree_setup_failure() {
                     .unwrap()
                     .set_task_id(root_run);
             });
-            let child = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
+            let mut child = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
             let (child_id, failure) = panes.prepare_restored_local_child(
                 root_id,
                 root_terminal.id(),
@@ -401,6 +360,17 @@ fn restored_local_child_subtree_setup_failure() {
             streamer.update(ctx, |streamer, ctx| {
                 streamer.fail_local_child_restoration(child_id, "missing token".into(), ctx)
             });
+            child.conversation_id = Some("later-token".into());
+            let (again_id, retry) = panes.prepare_restored_local_child(
+                root_id,
+                root_terminal.id(),
+                &child,
+                HashMap::new(),
+                ctx,
+            );
+            assert_eq!(again_id, child_id);
+            assert!(retry.unwrap().is_none());
+            assert!(!panes.child_agent_panes.contains_key(&child_id));
             let mut grandchild = ambient_agent_task_for_current_user(new_ambient_agent_task_id());
             grandchild.conversation_id = Some("grandchild-token".into());
             let (grandchild_id, grandchild_terminal) = panes.prepare_restored_local_child(
@@ -461,6 +431,14 @@ fn restored_local_child_subtree_setup_failure() {
             assert_eq!(
                 history.conversation(&child_id).unwrap().status(),
                 &ConversationStatus::Error
+            );
+            assert!(
+                history
+                    .conversation(&child_id)
+                    .unwrap()
+                    .status_error_message()
+                    .unwrap()
+                    .contains("missing token")
             );
             assert!(
                 !history
@@ -686,7 +664,9 @@ fn restored_local_child_subtree_message() {
             assert_eq!(grandchild.get_root_task_id().to_string(), "existing-root");
             let exchange = grandchild.root_task_exchanges().last().unwrap();
             assert!(exchange.input.iter().any(|input| matches!(input, crate::ai::agent::AIAgentInput::MessagesReceivedFromAgents { messages } if messages[0].sender_agent_id == child_run.to_string())));
-            assert_eq!(panes.restored_local_descendant_conversations.len(), 2);
+            assert_eq!(history.conversation_id_for_agent_id(&child_run.to_string()), Some(child_id));
+            assert_eq!(history.conversation_id_for_agent_id(&grandchild_run.to_string()), Some(grandchild_id));
+            assert_eq!(history.child_conversation_ids_of(&child_id), &[grandchild_id]);
             assert_eq!(panes.child_agent_panes.len(), 2);
             assert_eq!(grandchild_terminal.as_ref(ctx).ai_controller().as_ref(ctx).get_ambient_agent_task_id(), Some(grandchild_run));
             assert_ne!(grandchild_terminal.id(), child_terminal.id());
