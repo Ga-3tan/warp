@@ -8,7 +8,7 @@ use ai::index::full_source_code_embedding::store_client::{IntermediateNode, Stor
 use ai::index::full_source_code_embedding::{
     self, CodebaseContextConfig, ContentHash, EmbeddingConfig, NodeHash, RepoMetadata,
 };
-use anyhow::anyhow;
+use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
@@ -139,6 +139,7 @@ use warp_graphql::queries::task_git_credentials::{
 #[cfg(not(target_family = "wasm"))]
 use warp_graphql::queries::task_secrets::{ManagedSecretValue, TaskSecretsInput};
 use warp_multi_agent_api::ConversationData;
+use warp_server_client::PresignedDownloadResponse;
 
 use super::ServerApi;
 #[cfg(not(target_family = "wasm"))]
@@ -797,8 +798,8 @@ pub struct CreateFileArtifactUploadResponse {
     pub upload_target: FileArtifactUploadTargetInfo,
 }
 
-/// A single git credential entry returned by `taskGitCredentials`.
-#[derive(Clone)]
+/// Credentials for one managed Git host.
+#[derive(Clone, serde::Deserialize)]
 pub struct GitCredential {
     /// The provider's OAuth or installation access token.
     pub token: String,
@@ -1007,8 +1008,10 @@ impl<'de> serde::Deserialize<'de> for ListRunsResponse {
     where
         D: serde::Deserializer<'de>,
     {
+        #[serde_with::serde_as]
         #[derive(serde::Deserialize)]
         struct RawResponse {
+            #[serde_as(deserialize_as = "serde_with::DefaultOnNull")]
             runs: Vec<serde_json::Value>,
         }
 
@@ -1764,7 +1767,7 @@ impl ServerApi {
         workload_token: String,
         supports_deferred_repositories: bool,
     ) -> anyhow::Result<ExecutionBootstrapData> {
-        let operation = ExecutionBootstrap::build(ExecutionBootstrapVariables {
+        let operation = ExecutionBootstrap::build_with_capabilities(ExecutionBootstrapVariables {
             execution_id: execution_id.to_string().into(),
             supports_deferred_repositories,
             secrets_input: TaskSecretsInput {
@@ -1775,7 +1778,7 @@ impl ServerApi {
                 task_id: task_id.to_string().into(),
             },
             request_context: get_request_context(),
-        });
+        })?;
         let response = self.send_graphql_request(operation, None).await?;
         let (config, attachments) = match response.task {
             BootstrapTaskResult::TaskOutput(output) => (
@@ -1957,7 +1960,7 @@ impl ServerApi {
     }
 }
 
-fn into_git_credential(
+pub(super) fn into_git_credential(
     credential: warp_graphql::queries::task_git_credentials::TaskGitCredential,
 ) -> GitCredential {
     GitCredential {
@@ -2881,13 +2884,15 @@ impl AIClient for ServerApi {
         // command and output grid contents.
         let response = self
             .get_public_api_response(&format!(
-                "agent/conversations/{conversation_id}/block-snapshot"
+                "agent/conversations/{conversation_id}/block-snapshot?redirect=false"
             ))
             .await?;
-        let json_bytes = response
-            .bytes()
+        let download = response
+            .json::<PresignedDownloadResponse>()
             .await
-            .map_err(|e| anyhow!("Failed to read block snapshot for {conversation_id}: {e}"))?;
+            .map_err(reqwest::Error::without_url)
+            .context("Failed to decode block snapshot download URL")?;
+        let json_bytes = self.base_client.download_presigned(&download.url).await?;
         SerializedBlock::from_json(&json_bytes)
     }
 
@@ -3803,6 +3808,7 @@ fn convert_harness(harness: warp_graphql::ai::AgentHarness) -> AIAgentHarness {
         warp_graphql::ai::AgentHarness::Oz => AIAgentHarness::Oz,
         warp_graphql::ai::AgentHarness::ClaudeCode => AIAgentHarness::ClaudeCode,
         warp_graphql::ai::AgentHarness::Gemini => AIAgentHarness::Gemini,
+        warp_graphql::ai::AgentHarness::Pi => AIAgentHarness::Pi,
         warp_graphql::ai::AgentHarness::Codex => AIAgentHarness::Codex,
         warp_graphql::ai::AgentHarness::Other(value) => {
             report_error!(
