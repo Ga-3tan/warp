@@ -86,7 +86,7 @@ pub(super) fn resolve(harness: Harness) -> Result<HarnessManifest, AgentDriverEr
 
 /// Selects an override, mounted manifest, or PATH sidecar, then falls back to built-in defaults.
 /// An override that is set but unusable is an error rather than a fall-through.
-fn discover(
+pub(super) fn discover(
     harness: Harness,
     override_dir: Option<&Path>,
     mounts_dir: &Path,
