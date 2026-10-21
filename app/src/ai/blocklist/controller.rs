@@ -45,7 +45,7 @@ use super::orchestration_event_streamer::{
     OrchestrationEventStreamer, OrchestrationEventStreamerEvent,
 };
 use super::orchestration_events::{OrchestrationEventService, OrchestrationEventServiceEvent};
-use super::queued_query::{QueuedQueryEvent, QueuedQueryId, QueuedQueryModel};
+use super::queued_query::{QueuedQueryEvent, QueuedQueryId, QueuedQueryModel, QueuedQueryOrigin};
 use super::{BlocklistAIInputModel, ResponseStreamId, hooks};
 use crate::ai::AIRequestUsageModel;
 use crate::ai::agent::api::{self, ServerConversationToken};
@@ -817,7 +817,19 @@ impl BlocklistAIController {
             self.cancel_conversation_progress(active_conversation_id, cancellation_reason, ctx);
         }
 
-        if let Some(slash_command_request) = SlashCommandRequest::from_query(query.as_str()) {
+        // A prompt an agent hook asked for is a message to the model, sent as written: it is not
+        // read for a slash command or a mode prefix, which would let a hook skip the prompt
+        // boundary.
+        let provenance = input_query
+            .queued_query_id
+            .map_or(PromptProvenance::User, |id| {
+                QueuedQueryModel::as_ref(ctx).provenance_for(conversation_id, id)
+            });
+        let is_hook_follow_up = provenance != PromptProvenance::User;
+
+        if !is_hook_follow_up
+            && let Some(slash_command_request) = SlashCommandRequest::from_query(query.as_str())
+        {
             // Only fired queued rows carry `queued_query_id`. For those rows, keep slash commands
             // (e.g. queued `/compact`) on the conversation they were queued on; direct slash
             // submissions still re-derive their target from the current UI selection.
@@ -843,13 +855,13 @@ impl BlocklistAIController {
         let submitted_prompt = (is_user_submitted_prompt && hooks::HookRuntime::is_active(ctx))
             .then(|| hooks::prompt::SubmittedPrompt {
                 text: query.clone(),
-                provenance: input_query
-                    .queued_query_id
-                    .map_or(PromptProvenance::User, |id| {
-                        QueuedQueryModel::as_ref(ctx).provenance_for(conversation_id, id)
-                    }),
+                provenance,
             });
-        let (query, user_query_mode) = extract_user_query_mode(query);
+        let (query, user_query_mode) = if is_hook_follow_up {
+            (query, UserQueryMode::Normal)
+        } else {
+            extract_user_query_mode(query)
+        };
 
         // Attribute /orchestrate queries to the slash-command entry surface.
         if matches!(user_query_mode, UserQueryMode::Orchestrate) {
@@ -991,7 +1003,9 @@ impl BlocklistAIController {
             &self.active_session,
             ctx,
         ) {
-            hooks::prompt::TurnPreparation::Ready => self.send_prepared_query(prepared, ctx),
+            hooks::prompt::TurnPreparation::Ready => {
+                self.send_prepared_query(prepared, ctx);
+            }
             hooks::prompt::TurnPreparation::Pending(decision) => {
                 ctx.spawn(decision, move |me, decision, ctx| {
                     me.conclude_prepared_query(prepared, decision, ctx);
@@ -1000,7 +1014,9 @@ impl BlocklistAIController {
         }
     }
 
-    /// Sends a query whose hooks let it through, or puts back what the halted query took.
+    /// Sends a query whose wait ended in its favor, or puts back what a query that is not sent
+    /// took. A turn whose finalization was left to this query is finished if the query does not
+    /// go out.
     fn conclude_prepared_query(
         &mut self,
         prepared: PreparedQuery,
@@ -1008,19 +1024,25 @@ impl BlocklistAIController {
         ctx: &mut ModelContext<Self>,
     ) {
         let conversation_id = prepared.conversation_id;
-        match hooks::prompt::finish_turn_preparation(conversation_id, &decision, ctx) {
-            hooks::prompt::PromptOutcome::Send => self.send_prepared_query(prepared, ctx),
-            hooks::prompt::PromptOutcome::DoNotSend { finalize_turn } => {
-                Self::restore_dirty_events(conversation_id, prepared.taken_dirty_events, ctx);
-                if finalize_turn {
-                    self.settle_turn_after_stop(conversation_id, ctx);
-                }
-            }
+        let outcome = hooks::prompt::finish_turn_preparation(conversation_id, &decision, ctx);
+        let sent = if outcome.send {
+            self.send_prepared_query(prepared, ctx)
+        } else {
+            Self::restore_dirty_events(conversation_id, prepared.taken_dirty_events, ctx);
+            false
+        };
+        if !sent && outcome.owes_earlier_turn {
+            self.settle_turn_after_stop(conversation_id, ctx);
         }
     }
 
-    /// The second half of [`Self::send_query`]: sends the inputs it prepared.
-    fn send_prepared_query(&mut self, prepared: PreparedQuery, ctx: &mut ModelContext<Self>) {
+    /// The second half of [`Self::send_query`]: sends the inputs it prepared. Returns whether
+    /// the request went out.
+    fn send_prepared_query(
+        &mut self,
+        prepared: PreparedQuery,
+        ctx: &mut ModelContext<Self>,
+    ) -> bool {
         let PreparedQuery {
             inputs,
             task_id,
@@ -1057,6 +1079,7 @@ impl BlocklistAIController {
             report_error!(e);
             Self::restore_dirty_events(conversation_id, taken_dirty_events, ctx);
         }
+        send_result.is_ok()
     }
 
     fn restore_dirty_events(
@@ -1108,22 +1131,47 @@ impl BlocklistAIController {
     }
 
     /// Sends whatever is queued for a conversation whose stop hooks have finished, and marks the
-    /// turn successful if nothing took the conversation over.
+    /// turn successful if nothing took the conversation over. A conversation that is not the one
+    /// this surface is working in keeps its queue for the next drain: sending from here would go
+    /// through the surface's own prompt path and cancel the conversation the person is in.
     fn settle_turn_after_stop(
         &mut self,
         conversation_id: AIConversationId,
         ctx: &mut ModelContext<Self>,
     ) {
-        self.dispatch_queued_warp_agent_prompt(conversation_id, None, ctx);
-        if !self.has_active_stream_for_conversation(conversation_id, ctx)
-            && !hooks::prompt::is_pending(conversation_id, ctx)
+        if self.has_active_stream_for_conversation(conversation_id, ctx)
+            || hooks::prompt::is_pending(conversation_id, ctx)
         {
-            self.finalize_held_turn(conversation_id, ctx);
+            return;
         }
+        let is_this_surfaces_conversation = self.native_prompt_conversation_id
+            == Some(conversation_id)
+            || BlocklistAIHistoryModel::as_ref(ctx).active_conversation_id(self.terminal_surface_id)
+                == Some(conversation_id);
+        if is_this_surfaces_conversation {
+            self.dispatch_queued_warp_agent_prompt(conversation_id, None, ctx);
+        }
+        if self.has_active_stream_for_conversation(conversation_id, ctx)
+            || hooks::prompt::is_pending(conversation_id, ctx)
+        {
+            return;
+        }
+        if QueuedQueryModel::as_ref(ctx)
+            .queue(conversation_id)
+            .first()
+            .is_some_and(|row| row.origin() == QueuedQueryOrigin::HookFollowUp)
+        {
+            log::warn!(
+                "a stop hook's follow-up for {conversation_id} could not be sent now and stays \
+                 queued until the conversation's next drain"
+            );
+        }
+        self.finalize_held_turn(conversation_id, ctx);
     }
 
     /// Finalizes a turn whose success was held, unless something else settled the conversation's
-    /// status in the meantime, and lets in orchestration events that waited for the status.
+    /// status or started a request in the meantime, and lets in orchestration events that waited
+    /// for the status.
     fn finalize_held_turn(
         &mut self,
         conversation_id: AIConversationId,
@@ -1132,7 +1180,7 @@ impl BlocklistAIController {
         let is_in_progress = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)
             .is_some_and(|conversation| conversation.status().is_in_progress());
-        if is_in_progress {
+        if is_in_progress && !self.has_active_stream_for_conversation(conversation_id, ctx) {
             self.finalize_turn(conversation_id, ctx);
             self.handle_pending_events_ready(conversation_id, ctx);
         }
@@ -2031,7 +2079,9 @@ impl BlocklistAIController {
             return None;
         }
         let row = QueuedQueryModel::as_ref(ctx).ready_head(conversation_id)?;
-        if row.is_command() {
+        // A prompt an agent hook asked for starts a turn of its own, through `send_query`, so
+        // it runs the prompt hooks and gets a turn id; it is never folded into a running turn.
+        if row.is_command() || row.origin() == QueuedQueryOrigin::HookFollowUp {
             return None;
         }
         if is_primary_injected_followup {
