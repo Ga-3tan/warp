@@ -100,6 +100,49 @@ fn persist_plan_config_with_harness(
     });
 }
 
+#[test]
+fn disabled_child_model_routing_denies_instead_of_launching_or_waiting_for_approval() {
+    let _child_models = FeatureFlag::ChildModelRouting.override_enabled(false);
+    for mode in [ExecutionMode::App, ExecutionMode::Sdk] {
+        App::test((), |mut app| async move {
+            let state = initialize_run_agents_test(&mut app, mode);
+            let mut action = remote_run_agents_action("oz");
+            let AIAgentActionType::RunAgents(request) = &mut action.action else {
+                panic!("expected run_agents action");
+            };
+            request.agent_run_configs[0].model_id = "child-model".to_string();
+            state.executor.update(&mut app, |executor, ctx| {
+                assert!(executor.should_autoexecute(
+                    ExecuteActionInput {
+                        action: &action,
+                        conversation_id: state.conversation_id
+                    },
+                    ctx,
+                ));
+                let execution = executor
+                    .execute(
+                        ExecuteActionInput {
+                            action: &action,
+                            conversation_id: state.conversation_id,
+                        },
+                        ctx,
+                    )
+                    .into();
+                let AnyActionExecution::Sync(AIAgentActionResultType::RunAgents(
+                    RunAgentsResult::Denied { reason },
+                )) = execution
+                else {
+                    panic!("expected synchronous denial");
+                };
+                assert_eq!(
+                    reason,
+                    "Per-child model overrides are not enabled on this client."
+                );
+            });
+        });
+    }
+}
+
 fn team_scope_for_team(team_uid: i64) -> TeamContextForOperation {
     TeamContextForOperation::new_for_test(ServerId::from(team_uid))
 }
@@ -707,6 +750,7 @@ fn persist_default_auth_secret(app: &mut App, harness_config_name: &str, secret_
 
 #[test]
 fn should_autoexecute_when_plan_has_approved_orchestration_config() {
+    let _child_models = FeatureFlag::ChildModelRouting.override_enabled(true);
     App::test((), |mut app| async move {
         let state = initialize_run_agents_test(&mut app, ExecutionMode::App);
         persist_plan_config(
@@ -715,19 +759,23 @@ fn should_autoexecute_when_plan_has_approved_orchestration_config() {
             "plan-1",
             OrchestrationConfigStatus::Approved,
         );
-        let action = with_plan_id(remote_run_agents_action("oz"), "plan-1");
-
-        let should_autoexecute = state.executor.update(&mut app, |executor, ctx| {
-            executor.should_autoexecute(
-                ExecuteActionInput {
-                    action: &action,
-                    conversation_id: state.conversation_id,
-                },
-                ctx,
-            )
-        });
-
-        assert!(should_autoexecute);
+        for (model_id, expected) in [("", true), ("auto", true), ("different-model", false)] {
+            let mut action = with_plan_id(remote_run_agents_action("oz"), "plan-1");
+            let AIAgentActionType::RunAgents(request) = &mut action.action else {
+                panic!("expected run_agents action");
+            };
+            request.agent_run_configs[0].model_id = model_id.to_string();
+            let should_autoexecute = state.executor.update(&mut app, |executor, ctx| {
+                executor.should_autoexecute(
+                    ExecuteActionInput {
+                        action: &action,
+                        conversation_id: state.conversation_id,
+                    },
+                    ctx,
+                )
+            });
+            assert_eq!(should_autoexecute, expected, "child model: {model_id}");
+        }
     });
 }
 

@@ -779,17 +779,20 @@ pub enum ChatGPTSubscriptionErrorActionKind {
     OpenUrl { url: String },
 }
 
-impl From<warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::action::Kind>
+impl TryFrom<warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::action::Kind>
     for ChatGPTSubscriptionErrorActionKind
 {
-    fn from(
+    type Error = ();
+
+    fn try_from(
         kind: warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::action::Kind,
-    ) -> Self {
+    ) -> Result<Self, Self::Error> {
         use warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::action::Kind;
         match kind {
-            Kind::Retry(_) => Self::Retry,
-            Kind::ContinueWithWarpCredits(_) => Self::ContinueWithWarpCredits,
-            Kind::OpenUrl(open_url) => Self::OpenUrl { url: open_url.url },
+            Kind::Retry(_) => Ok(Self::Retry),
+            Kind::ContinueWithWarpCredits(_) => Ok(Self::ContinueWithWarpCredits),
+            Kind::OpenUrl(open_url) => Ok(Self::OpenUrl { url: open_url.url }),
+            Kind::CopyText(_) => Err(()),
         }
     }
 }
@@ -805,7 +808,7 @@ impl RenderableAIError {
             .into_iter()
             .filter_map(|action| {
                 Some(ChatGPTSubscriptionErrorAction {
-                    kind: action.kind?.into(),
+                    kind: action.kind?.try_into().ok()?,
                     label: action.label,
                 })
             })

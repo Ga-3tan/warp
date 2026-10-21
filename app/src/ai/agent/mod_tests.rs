@@ -136,7 +136,7 @@ fn chatgpt_subscription_error_maps_known_actions_and_drops_unknown_kinds() {
     use warp_multi_agent_api::response_event::stream_finished::ChatGptSubscriptionError;
     use warp_multi_agent_api::response_event::stream_finished::chat_gpt_subscription_error::{
         Action,
-        action::{ContinueWithWarpCredits, Kind, Retry},
+        action::{ContinueWithWarpCredits, CopyText, Kind, Retry},
     };
 
     let error = RenderableAIError::from_chatgpt_subscription_error(ChatGptSubscriptionError {
@@ -152,6 +152,12 @@ fn chatgpt_subscription_error_maps_known_actions_and_drops_unknown_kinds() {
             Action {
                 label: "From a newer server".to_string(),
                 kind: None,
+            },
+            Action {
+                label: "Unsupported copy action".to_string(),
+                kind: Some(Kind::CopyText(CopyText {
+                    text: "diagnostic".to_string(),
+                })),
             },
             Action {
                 label: "Continue with Warp credits".to_string(),

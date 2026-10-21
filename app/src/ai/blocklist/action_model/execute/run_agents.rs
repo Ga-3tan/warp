@@ -487,6 +487,14 @@ impl RunAgentsExecutor {
         let AIAgentActionType::RunAgents(request) = &input.action.action else {
             return false;
         };
+        if !FeatureFlag::ChildModelRouting.is_enabled()
+            && request
+                .agent_run_configs
+                .iter()
+                .any(|cfg| !cfg.model_id.is_empty())
+        {
+            return true;
+        }
         if AppExecutionMode::as_ref(ctx).is_autonomous() {
             return true;
         }
@@ -550,6 +558,10 @@ fn approved_orchestration_config_can_autoexecute(
     let mut resolved_request = request.clone();
     resolve_request_from_approved_config(&mut resolved_request, parent_conversation_id, ctx)
         .is_some_and(|status| status.is_approved())
+        && resolved_request.agent_run_configs.iter().all(|cfg| {
+            cfg.model_id.trim().is_empty()
+                || cfg.model_id.trim() == resolved_request.model_id.trim()
+        })
         && can_execute_with_auth_secret(&resolved_request, team_scope, ctx)
 }
 
@@ -580,6 +592,14 @@ fn prepare_request_for_execution(
     team_scope: &(impl TeamScope + ?Sized),
     ctx: &ModelContext<RunAgentsExecutor>,
 ) -> Option<String> {
+    if !FeatureFlag::ChildModelRouting.is_enabled()
+        && request
+            .agent_run_configs
+            .iter()
+            .any(|cfg| !cfg.model_id.is_empty())
+    {
+        return Some("Per-child model overrides are not enabled on this client.".to_string());
+    }
     let status = resolve_request_from_approved_config(request, parent_conversation_id, ctx);
     populate_default_auth_secret_for_execution(request, team_scope, ctx);
     if let Some(reason) =
@@ -740,6 +760,14 @@ fn resolve_request_from_config(request: &mut RunAgentsRequest, config: &Orchestr
 /// Defence-in-depth validation; mirrors the card view's
 /// `accept_disabled_reason` check.
 fn validate_request(request: &RunAgentsRequest) -> Result<(), String> {
+    if !FeatureFlag::ChildModelRouting.is_enabled()
+        && request
+            .agent_run_configs
+            .iter()
+            .any(|cfg| !cfg.model_id.is_empty())
+    {
+        return Err("Per-child model overrides are not enabled on this client.".to_string());
+    }
     if request.agent_run_configs.is_empty() {
         return Err("orchestrate: empty agent_run_configs".to_string());
     }
