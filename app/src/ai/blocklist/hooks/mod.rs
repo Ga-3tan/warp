@@ -572,7 +572,9 @@ pub(crate) mod testing {
     use warp_multi_agent_api::client_action::{AddMessagesToTask, CreateTask};
     use warp_multi_agent_api::message::{AgentOutput, Message as MessageKind};
     use warp_multi_agent_api::response_event::{StreamFinished, StreamInit, stream_finished};
-    use warp_multi_agent_api::{ClientAction, Message, ResponseEvent, Task, client_action, response_event};
+    use warp_multi_agent_api::{
+        ClientAction, Message, ResponseEvent, Task, client_action, response_event,
+    };
     use warpui::r#async::Timer;
     use warpui::{App, AppContext, Entity, EntityId, ModelHandle, SingletonEntity, ViewHandle};
 
@@ -618,13 +620,17 @@ pub(crate) mod testing {
         }
 
         pub(crate) fn controller(&self, app: &App) -> ModelHandle<BlocklistAIController> {
-            self.terminal.read(app, |view, _| view.ai_controller().clone())
+            self.terminal
+                .read(app, |view, _| view.ai_controller().clone())
         }
 
         pub(crate) fn update_controller<T>(
             &self,
             app: &mut App,
-            update: impl FnOnce(&mut BlocklistAIController, &mut warpui::ModelContext<BlocklistAIController>) -> T,
+            update: impl FnOnce(
+                &mut BlocklistAIController,
+                &mut warpui::ModelContext<BlocklistAIController>,
+            ) -> T,
         ) -> T {
             let controller = self.controller(app);
             controller.update(app, update)
@@ -661,9 +667,7 @@ pub(crate) mod testing {
                                     model_id: LLMId::from("test-model"),
                                     coding_model_id: LLMId::from("test-coding-model"),
                                     cli_agent_model_id: LLMId::from("test-cli-agent-model"),
-                                    computer_use_model_id: LLMId::from(
-                                        "test-computer-use-model",
-                                    ),
+                                    computer_use_model_id: LLMId::from("test-computer-use-model"),
                                     shared_session_response_initiator: None,
                                     request_start_ts: Local::now(),
                                     supported_tools_override: None,
@@ -749,7 +753,10 @@ pub(crate) mod testing {
 
     /// A batch that creates the root task (the stream's first action does this in production)
     /// and adds `messages` to it.
-    pub(crate) fn create_task_with_messages(task_id: &str, messages: Vec<Message>) -> ResponseEvent {
+    pub(crate) fn create_task_with_messages(
+        task_id: &str,
+        messages: Vec<Message>,
+    ) -> ResponseEvent {
         ResponseEvent {
             r#type: Some(response_event::Type::ClientActions(
                 response_event::ClientActions {
@@ -818,7 +825,10 @@ pub(crate) mod testing {
     pub(crate) fn record_statuses(
         app: &mut App,
         conversation_id: AIConversationId,
-    ) -> (ModelHandle<StatusRecorder>, Arc<Mutex<Vec<ConversationStatus>>>) {
+    ) -> (
+        ModelHandle<StatusRecorder>,
+        Arc<Mutex<Vec<ConversationStatus>>>,
+    ) {
         let statuses = Arc::new(Mutex::new(Vec::new()));
         let recorder = app.add_model(|ctx: &mut warpui::ModelContext<StatusRecorder>| {
             ctx.subscribe_to_model(&BlocklistAIHistoryModel::handle(ctx), |me, _, event, _| {
@@ -873,7 +883,12 @@ pub(crate) mod testing {
 
     /// A session over a mock terminal, with the dispatcher that feeds it, for envelopes that
     /// need a working directory to read.
-    fn mock_session(app: &mut App) -> (ModelHandle<ActiveSession>, ModelHandle<ModelEventDispatcher>) {
+    fn mock_session(
+        app: &mut App,
+    ) -> (
+        ModelHandle<ActiveSession>,
+        ModelHandle<ModelEventDispatcher>,
+    ) {
         let sessions = app.add_model(|_| Sessions::new_for_test());
         let (_tx, rx) = unbounded();
         let dispatcher = app.add_model(|ctx| ModelEventDispatcher::new(rx, sessions.clone(), ctx));
