@@ -37,7 +37,7 @@ use crate::ai::blocklist::agent_view::shortcuts::render_keystroke_with_color_ove
 use crate::ai::blocklist::block::cli_controller::{CLISubagentController, CLISubagentEvent};
 use crate::ai::blocklist::{
     BlocklistAIHistoryEvent, BlocklistAIHistoryModel, QueuedQueryEvent, QueuedQueryId,
-    QueuedQueryModel, QueuedQueryOrigin,
+    QueuedQueryModel, QueuedQueryOrigin, QueuedQueryTiming,
 };
 use crate::appearance::Appearance;
 use crate::editor::{
@@ -948,6 +948,7 @@ impl View for QueuedPromptsPanelView {
                         panel_view_id,
                         index,
                         origin: query.origin(),
+                        timing: query.timing(),
                         is_command: query.is_command(),
                         is_in_edit_mode,
                         is_being_dragged,
@@ -1121,6 +1122,7 @@ struct RenderRowProps<'a> {
     panel_view_id: EntityId,
     index: usize,
     origin: QueuedQueryOrigin,
+    timing: QueuedQueryTiming,
     /// Whether this row is a shell command (rendered with a blue `!` prefix) vs an agent prompt.
     is_command: bool,
     is_in_edit_mode: bool,
@@ -1138,6 +1140,7 @@ fn render_row(props: RenderRowProps<'_>, app: &AppContext) -> Box<dyn Element> {
         panel_view_id,
         index,
         origin,
+        timing,
         is_command,
         is_in_edit_mode,
         is_being_dragged,
@@ -1204,7 +1207,7 @@ fn render_row(props: RenderRowProps<'_>, app: &AppContext) -> Box<dyn Element> {
             .finish()
         } else {
             // Single-line preview that truncates by width with a trailing ellipsis.
-            let preview = Text::new(
+            Text::new(
                 preview_text.clone(),
                 appearance.ui_font_family(),
                 queued_input_font_size,
@@ -1213,52 +1216,57 @@ fn render_row(props: RenderRowProps<'_>, app: &AppContext) -> Box<dyn Element> {
             .with_selectable(false)
             .soft_wrap(false)
             .with_clip(ClipConfig::ellipsis())
-            .finish();
-            // Command rows are prefaced with a blue `!` so they read as shell commands; prompt
-            // rows render their text directly. Rows auto-queued during an agent-requested
-            // long-running command carry an italic suffix explaining when they will fire.
-            if is_command {
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(4.)
-                    .with_child(
-                        Text::new("!", appearance.ui_font_family(), queued_input_font_size)
-                            .with_color(command_prefix_color)
-                            .with_selectable(false)
-                            .finish(),
-                    )
-                    .with_child(Expanded::new(1., preview).finish())
-                    .finish()
-            } else if origin == QueuedQueryOrigin::LrcAutoQueue
-                || origin == QueuedQueryOrigin::PendingLrcAutoQueue
-            {
-                let suffix_color: ColorU = theme.sub_text_color(theme.surface_1()).into();
-                let suffix = Text::new(
-                    LRC_AUTO_QUEUE_ROW_SUFFIX.to_owned(),
-                    appearance.ui_font_family(),
-                    queued_input_font_size,
-                )
-                .with_color(suffix_color)
-                .with_style(Properties {
-                    style: Style::Italic,
-                    weight: Weight::Normal,
-                })
-                .with_selectable(false)
-                .soft_wrap(false)
-                .finish();
-                // The preview shrinks to its text (clipping with an ellipsis when long) so the
-                // suffix hugs it, mirroring the model picker's "(selected)" treatment.
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(6.)
-                    .with_child(Shrinkable::new(1., preview).finish())
-                    .with_child(suffix)
-                    .finish()
-            } else {
-                preview
-            }
+            .finish()
         };
 
+        let prompt_text_or_editor = if is_command {
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(4.)
+                .with_child(
+                    Text::new("!", appearance.ui_font_family(), queued_input_font_size)
+                        .with_color(command_prefix_color)
+                        .with_selectable(false)
+                        .finish(),
+                )
+                .with_child(Expanded::new(1., prompt_text_or_editor).finish())
+                .finish()
+        } else {
+            prompt_text_or_editor
+        };
+        let suffix = if matches!(
+            origin,
+            QueuedQueryOrigin::LrcAutoQueue | QueuedQueryOrigin::PendingLrcAutoQueue
+        ) {
+            Some(LRC_AUTO_QUEUE_ROW_SUFFIX)
+        } else {
+            match timing {
+                QueuedQueryTiming::NextTurn => Some("(next turn)"),
+                QueuedQueryTiming::AfterResponse => Some("(after response)"),
+                QueuedQueryTiming::InheritConversation => None,
+            }
+        };
+        let prompt_text_or_editor = if let Some(suffix) = suffix {
+            let suffix_color: ColorU = theme.sub_text_color(theme.surface_1()).into();
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(6.)
+                .with_child(Shrinkable::new(1., prompt_text_or_editor).finish())
+                .with_child(
+                    Text::new(suffix, appearance.ui_font_family(), queued_input_font_size)
+                        .with_color(suffix_color)
+                        .with_style(Properties {
+                            style: Style::Italic,
+                            weight: Weight::Normal,
+                        })
+                        .with_selectable(false)
+                        .soft_wrap(false)
+                        .finish(),
+                )
+                .finish()
+        } else {
+            prompt_text_or_editor
+        };
         let drag_handle: Box<dyn Element> = if !show_drag_handle {
             // Reserve the handle's footprint without drawing it (single-row queue).
             ConstrainedBox::new(Empty::new().finish())

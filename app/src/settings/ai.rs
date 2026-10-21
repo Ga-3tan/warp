@@ -971,6 +971,53 @@ impl PromptSubmissionMode {
     }
 }
 
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    EnumIter,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(rename_all = "snake_case")]
+pub enum UnqueuedPromptBehavior {
+    #[default]
+    Interrupt,
+    Steer,
+}
+
+settings::macros::implement_setting_for_enum!(
+    UnqueuedPromptBehavior,
+    AISettings,
+    SupportedPlatforms::DESKTOP,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "agents.warp_agent.other.unqueued_prompt_behavior",
+    description: "Behavior of local prompts when full-response queueing is off.",
+    feature_flag: FeatureFlag::AgentPromptSteering,
+);
+
+impl UnqueuedPromptBehavior {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Interrupt => "Interrupt",
+            Self::Steer => "Steer",
+        }
+    }
+
+    pub fn command_palette_description(&self) -> &'static str {
+        match self {
+            Self::Interrupt => "Set unqueued prompt behavior: interrupt",
+            Self::Steer => "Set unqueued prompt behavior: steer",
+        }
+    }
+}
+
 /// What happens when a prompt is submitted while an agent controls an agent-requested
 /// long-running command (LRC).
 ///
@@ -2068,6 +2115,7 @@ define_settings_group!(AISettings, settings: [
     // responding. Per-conversation overrides live on `QueuedQueryModel`; this
     // setting is the fallback used when a conversation has no explicit override.
     default_prompt_submission_mode: PromptSubmissionMode,
+    unqueued_prompt_behavior: UnqueuedPromptBehavior,
 
     // What happens when a prompt is submitted while an agent controls an agent-requested
     // long-running command. Only consulted when `default_prompt_submission_mode` is `Interrupt`;

@@ -44,7 +44,7 @@ use super::orchestration_event_streamer::{
     OrchestrationEventStreamer, OrchestrationEventStreamerEvent,
 };
 use super::orchestration_events::{OrchestrationEventService, OrchestrationEventServiceEvent};
-use super::queued_query::{QueuedQueryEvent, QueuedQueryId, QueuedQueryModel};
+use super::queued_query::{QueuedQueryEvent, QueuedQueryId, QueuedQueryModel, QueuedQueryTiming};
 use super::{BlocklistAIInputModel, ResponseStreamId};
 use crate::ai::AIRequestUsageModel;
 use crate::ai::agent::api::{self, ServerConversationToken};
@@ -686,6 +686,7 @@ impl BlocklistAIController {
                     conversation_id, ..
                 } => {
                     me.maybe_interrupt_command_for_injection(*conversation_id, ctx);
+                    me.dispatch_local_steering_prompt_when_idle(*conversation_id, ctx);
                 }
                 QueuedQueryEvent::EditEntered { .. }
                 | QueuedQueryEvent::Cleared { .. }
@@ -1847,23 +1848,43 @@ impl BlocklistAIController {
         )
     }
 
-    /// Takes one ready injected followup or steering prompt and updates its response attribution.
+    /// Prepares one ready injected followup or steering prompt without removing its queue row.
     fn steer_head_prompt_for_request(
         &mut self,
         conversation_id: AIConversationId,
         task_id: &TaskId,
+        allow_local_steering: bool,
         ctx: &mut ModelContext<Self>,
-    ) -> Option<AIAgentInput> {
+    ) -> Option<(AIAgentInput, QueuedQueryId)> {
         self.maybe_interrupt_command_for_injection(conversation_id, ctx);
         let is_primary_injected_followup =
             self.has_ready_primary_injected_followup(conversation_id, ctx);
-        if (!QueuedQueryModel::as_ref(ctx).is_steering(conversation_id)
-            && !is_primary_injected_followup)
-            || QueuedQueryModel::as_ref(ctx).is_dispatch_blocked(conversation_id)
-        {
-            return None;
-        }
-        let row = QueuedQueryModel::as_ref(ctx).ready_head(conversation_id)?;
+        let queue = QueuedQueryModel::as_ref(ctx);
+        let inherited_row = queue.ready_head(conversation_id).filter(|row| {
+            row.timing() == QueuedQueryTiming::InheritConversation
+                && (queue.is_steering(conversation_id) || is_primary_injected_followup)
+        });
+        let row = inherited_row.or_else(|| {
+            (allow_local_steering
+                && self.is_local_native_prompt_target(conversation_id, ctx)
+                && !OrchestrationEventService::as_ref(ctx).is_conversation_exiting(conversation_id)
+                && BlocklistAIHistoryModel::as_ref(ctx)
+                    .conversation(&conversation_id)
+                    .is_some_and(|conversation| {
+                        !conversation.is_summarizing()
+                            && match conversation.status() {
+                                ConversationStatus::InProgress
+                                | ConversationStatus::Success
+                                | ConversationStatus::Blocked { .. }
+                                | ConversationStatus::WaitingForEvents => true,
+                                ConversationStatus::Error
+                                | ConversationStatus::TransientError
+                                | ConversationStatus::Cancelled => false,
+                            }
+                    }))
+            .then(|| queue.ready_next_turn(conversation_id))
+            .flatten()
+        })?;
         if row.is_command() {
             return None;
         }
@@ -1941,9 +1962,6 @@ impl BlocklistAIController {
             )
         };
 
-        QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
-            queue.remove_fired_row(conversation_id, query_id, ctx);
-        });
         if is_primary_injected_followup {
             self.commands_interrupted_for_injection
                 .remove(&conversation_id);
@@ -1952,7 +1970,7 @@ impl BlocklistAIController {
             "event=steered_prompt_included conversation_id={conversation_id} query_id={query_id:?}"
         );
 
-        Some(input)
+        Some((input, query_id))
     }
 
     fn send_exit_prompt_to_long_running_command(
@@ -2108,17 +2126,8 @@ impl BlocklistAIController {
         let root_task_id = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)
             .map(|conversation| conversation.get_root_task_id().clone());
-        let steered_input = root_task_id
-            .as_ref()
-            .and_then(|task_id| self.steer_head_prompt_for_request(conversation_id, task_id, ctx));
-        if finished_results.is_empty() && steered_input.is_none() {
-            return;
-        }
-
-        // Check whether any result will trigger a server-side subagent (e.g. CLI
-        // subagent for LRC), or if one is already active. If so, we must not
-        // piggyback orchestration events because the subagent cannot interpret
-        // them and inserting events breaks tool_use/tool_result ordering.
+        // Subagents cannot interpret parent orchestration events or steering inputs without
+        // breaking tool_use/tool_result ordering.
         let will_trigger_server_subagent = finished_results
             .iter()
             .any(|r| r.result.triggers_server_subagent());
@@ -2126,6 +2135,17 @@ impl BlocklistAIController {
             .conversation(&conversation_id)
             .map(|c| (c.has_active_subagent(), c.driver().owns_turn_lifecycle()))
             .unwrap_or((false, true));
+        let allow_local_steering = !finished_results.is_empty()
+            && !will_trigger_server_subagent
+            && !has_active_subagent
+            && owns_turn_lifecycle;
+        let steered_input = root_task_id.as_ref().and_then(|task_id| {
+            self.steer_head_prompt_for_request(conversation_id, task_id, allow_local_steering, ctx)
+        });
+        let steered_query_id = steered_input.as_ref().map(|(_, id)| *id);
+        if finished_results.is_empty() && steered_input.is_none() {
+            return;
+        }
 
         let context = input_context_for_request(
             false,
@@ -2147,12 +2167,9 @@ impl BlocklistAIController {
             ctx,
         );
 
-        // A steered input is the fired head of the queue, so its presence is exactly what
-        // `send_request_input` needs to know to skip resetting the user's live draft context
-        // below -- neither `finished_results` nor a piggybacked orchestration event ever
-        // produces a `UserQuery`, so the steered input is the only possible source of one here.
+        // Only the queued input can produce a UserQuery here; preserve the user's live draft.
         let is_queued_prompt = steered_input.is_some();
-        if let (Some(steered_input), Some(root_task_id)) = (steered_input, root_task_id) {
+        if let (Some((steered_input, _)), Some(root_task_id)) = (steered_input, root_task_id) {
             request_input
                 .input_messages
                 .push((root_task_id, vec![steered_input]));
@@ -2193,6 +2210,13 @@ impl BlocklistAIController {
             is_queued_prompt,
             ctx,
         );
+        if result.is_ok()
+            && let Some(query_id) = steered_query_id
+        {
+            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
+                queue.remove_fired_row(conversation_id, query_id, ctx);
+            });
+        }
 
         if has_piggybacked_events && result.is_err() {
             OrchestrationEventService::handle(ctx).update(ctx, |svc, ctx| {
@@ -2470,11 +2494,13 @@ impl BlocklistAIController {
             .conversation(&conversation_id)
             .map(|conversation| conversation.get_root_task_id().clone());
         let steered_input = root_task_id.as_ref().and_then(|root_task_id| {
-            self.steer_head_prompt_for_request(conversation_id, root_task_id, ctx)
+            let allow_local = BlocklistAIHistoryModel::as_ref(ctx)
+                .conversation(&conversation_id)
+                .is_some_and(|c| !c.has_active_subagent());
+            self.steer_head_prompt_for_request(conversation_id, root_task_id, allow_local, ctx)
         });
-        // See the identical comment in `send_follow_up_for_conversation`: a steered input is
-        // the only possible source of a `UserQuery` here, so its presence is exactly the signal
-        // `send_request_input` needs to skip resetting the user's live draft context.
+        let steered_query_id = steered_input.as_ref().map(|(_, id)| *id);
+        // Only the queued input can produce a UserQuery here; preserve the user's live draft.
         let is_queued_prompt = steered_input.is_some();
 
         let scope = ResolvedTeamScope::from_scope(&self.team_context(ctx));
@@ -2488,21 +2514,26 @@ impl BlocklistAIController {
             &scope,
             ctx,
         );
-        if let (Some(steered_input), Some(root_task_id)) = (steered_input, root_task_id) {
+        if let (Some((steered_input, _)), Some(root_task_id)) = (steered_input, root_task_id) {
             request_input
                 .input_messages
                 .push((root_task_id, vec![steered_input]));
         }
-        if self
-            .send_request_input(
-                request_input,
-                None,
-                RecoveryBudget::fresh(),
-                is_queued_prompt,
-                ctx,
-            )
-            .is_err()
+        let result = self.send_request_input(
+            request_input,
+            None,
+            RecoveryBudget::fresh(),
+            is_queued_prompt,
+            ctx,
+        );
+        if result.is_ok()
+            && let Some(query_id) = steered_query_id
         {
+            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
+                queue.remove_fired_row(conversation_id, query_id, ctx);
+            });
+        }
+        if result.is_err() {
             // TODO: surface retry exhaustion. The existing requeue
             // re-emits `EventsReady` until `MAX_RETRY_ATTEMPTS` is hit,
             // after which events are dropped silently and the wait has
@@ -3263,6 +3294,66 @@ impl BlocklistAIController {
     ) -> bool {
         self.in_flight_response_streams
             .has_active_stream_for_conversation(conversation_id, app)
+    }
+
+    pub(crate) fn dispatch_local_steering_prompt_when_idle(
+        &mut self,
+        conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !self.is_local_native_prompt_target(conversation_id, ctx)
+            || !self.can_dispatch_queued_warp_agent_prompt(conversation_id, ctx)
+            || !QueuedQueryModel::as_ref(ctx)
+                .ready_head(conversation_id)
+                .is_some_and(|row| row.timing() == QueuedQueryTiming::NextTurn)
+        {
+            return;
+        }
+        let Some(task_id) = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .map(|conversation| conversation.get_root_task_id().clone())
+        else {
+            return;
+        };
+        let Some((input, query_id)) =
+            self.steer_head_prompt_for_request(conversation_id, &task_id, true, ctx)
+        else {
+            return;
+        };
+        let scope = ResolvedTeamScope::from_scope(&self.team_context(ctx));
+        let request = RequestInput::for_task(
+            vec![input],
+            task_id,
+            &self.active_session,
+            self.get_current_response_initiator(),
+            conversation_id,
+            self.terminal_surface_id,
+            &scope,
+            ctx,
+        );
+        if self
+            .send_request_input(request, None, RecoveryBudget::fresh(), true, ctx)
+            .is_ok()
+        {
+            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
+                queue.remove_fired_row(conversation_id, query_id, ctx);
+            });
+        }
+    }
+
+    pub(crate) fn is_local_native_prompt_target(
+        &self,
+        conversation_id: AIConversationId,
+        ctx: &AppContext,
+    ) -> bool {
+        self.ambient_agent_task_id.is_none()
+            && self.native_prompt_conversation_id.is_none()
+            && BlocklistAIHistoryModel::as_ref(ctx)
+                .all_live_conversations_for_terminal_surface(self.terminal_surface_id)
+                .any(|conversation| {
+                    conversation.id() == conversation_id
+                        && conversation.driver().owns_turn_lifecycle()
+                })
     }
 
     /// Whether a fresh automatic prompt can start without interrupting ongoing work.

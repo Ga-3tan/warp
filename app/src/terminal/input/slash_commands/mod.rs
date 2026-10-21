@@ -1300,6 +1300,7 @@ impl Input {
                     });
 
                 if should_queue {
+                    let timing = self.local_queued_prompt_timing(conversation_id, ctx);
                     let attachments = self.ai_context_model.update(ctx, |context_model, ctx| {
                         context_model.take_pending_attachments(ctx)
                     });
@@ -1310,7 +1311,8 @@ impl Input {
                                 prompt,
                                 QueuedQueryOrigin::QueueSlashCommand,
                                 attachments,
-                            ),
+                            )
+                            .with_timing(timing),
                             ctx,
                         );
                     });
@@ -1590,6 +1592,7 @@ impl Input {
         let Some(initial_prompt) = initial_prompt.filter(|prompt| !prompt.trim().is_empty()) else {
             return;
         };
+        let timing = self.local_queued_prompt_timing(conversation_id, ctx);
         QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
             model.append(
                 conversation_id,
@@ -1597,7 +1600,8 @@ impl Input {
                     initial_prompt,
                     QueuedQueryOrigin::CompactAndSlashCommand,
                     followup_attachments,
-                ),
+                )
+                .with_timing(timing),
                 ctx,
             )
         });

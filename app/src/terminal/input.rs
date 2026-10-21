@@ -184,7 +184,7 @@ use crate::ai::blocklist::{
     BlocklistAIInputEvent, BlocklistAIInputModel, DIFF_HUNK_ATTACHMENT_REGEX,
     DRIVE_OBJECT_ATTACHMENT_REGEX, InputConfig, InputType, InputTypeAutoDetectionSource,
     PendingAttachment, PendingFile, QueuedQuery, QueuedQueryEvent, QueuedQueryId, QueuedQueryModel,
-    QueuedQueryOrigin, SlashCommandRequest, ai_brand_color, ai_indicator_height,
+    QueuedQueryOrigin, QueuedQueryTiming, SlashCommandRequest, ai_brand_color, ai_indicator_height,
     render_ai_agent_mode_icon, render_ai_follow_up_icon,
 };
 use crate::ai::cloud_agent_settings::{AuthSecretPreference, CloudAgentSettings};
@@ -276,7 +276,7 @@ use crate::session_management::SessionNavigationPromptElements;
 use crate::settings::{
     AISettings, AISettingsChangedEvent, AliasExpansionSettings, AppEditorSettings,
     AppEditorSettingsChangedEvent, InputModeSettings, InputSettings, InputSettingsChangedEvent,
-    MAX_TIMES_TO_SHOW_AUTOSUGGESTION_HINT, PrivacySettings,
+    MAX_TIMES_TO_SHOW_AUTOSUGGESTION_HINT, PrivacySettings, UnqueuedPromptBehavior,
 };
 use crate::settings_view::{SettingsSection, flags};
 use crate::suggestions::ignored_suggestions_model::{
@@ -14130,6 +14130,7 @@ impl Input {
             || self.maybe_queue_input_for_in_progress_conversation(ctx)
             || self.maybe_queue_input_during_cloud_setup(ctx)
             || self.maybe_handle_enter_for_slash_command(ctx)
+            || self.maybe_steer_input_for_in_progress_conversation(ctx)
         {
             return;
         } else if matches!(
@@ -14914,9 +14915,106 @@ impl Input {
             });
             QueuedQuery::new_with_attachments(prompt, origin, attachments)
         };
+        let query = if is_command {
+            query
+        } else {
+            query.with_timing(self.local_queued_prompt_timing(conversation_id, ctx))
+        };
         QueuedQueryModel::handle(ctx)
             .update(ctx, |model, ctx| model.append(conversation_id, query, ctx));
 
+        true
+    }
+
+    pub(in crate::terminal) fn local_queued_prompt_timing(
+        &self,
+        conversation_id: AIConversationId,
+        ctx: &AppContext,
+    ) -> QueuedQueryTiming {
+        if FeatureFlag::AgentPromptSteering.is_enabled()
+            && FeatureFlag::QueueSlashCommand.is_enabled()
+            && self
+                .ai_controller
+                .as_ref(ctx)
+                .is_local_native_prompt_target(conversation_id, ctx)
+            && self.ambient_agent_task_id(ctx).is_none()
+            && resolve_ai_query_routing(
+                self.terminal_view_id,
+                self.ambient_agent_view_model(),
+                &self.model.lock(),
+                ctx,
+            )
+            .is_local()
+        {
+            QueuedQueryTiming::AfterResponse
+        } else {
+            QueuedQueryTiming::InheritConversation
+        }
+    }
+
+    fn maybe_steer_input_for_in_progress_conversation(
+        &mut self,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        if !FeatureFlag::AgentPromptSteering.is_enabled()
+            || !FeatureFlag::QueueSlashCommand.is_enabled()
+            || AISettings::as_ref(ctx).unqueued_prompt_behavior != UnqueuedPromptBehavior::Steer
+            || !self.ai_input_model.as_ref(ctx).is_ai_input_enabled()
+            || CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.terminal_view_id)
+            || self.ambient_agent_task_id(ctx).is_some()
+            || !resolve_ai_query_routing(
+                self.terminal_view_id,
+                self.ambient_agent_view_model(),
+                &self.model.lock(),
+                ctx,
+            )
+            .is_local()
+        {
+            return false;
+        }
+        let Some(conversation_id) = self
+            .ai_context_model
+            .as_ref(ctx)
+            .selected_conversation_id(ctx)
+        else {
+            return false;
+        };
+        if !self
+            .ai_controller
+            .as_ref(ctx)
+            .is_local_native_prompt_target(conversation_id, ctx)
+            || !BlocklistAIHistoryModel::as_ref(ctx)
+                .conversation(&conversation_id)
+                .is_some_and(|c| {
+                    !c.is_empty()
+                        && !c.is_summarizing()
+                        && (c.status().is_in_progress() || c.status().is_blocked())
+                })
+            || QueuedQueryModel::as_ref(ctx).is_dispatch_blocked(conversation_id)
+            || QueuedQueryModel::as_ref(ctx).has_command_in_flight(conversation_id)
+        {
+            return false;
+        }
+        let prompt = self.editor.as_ref(ctx).buffer_text(ctx);
+        if prompt.trim().is_empty() || prompt.trim_start().starts_with('/') {
+            return false;
+        }
+        let attachments = self
+            .ai_context_model
+            .update(ctx, |context, ctx| context.take_pending_attachments(ctx));
+        self.ai_input_model
+            .update(ctx, |model, ctx| model.handle_input_buffer_submitted(ctx));
+        self.emit_input_buffer_submitted_telemetry(ctx);
+        self.editor
+            .update(ctx, |editor, ctx| editor.clear_buffer(ctx));
+        let query = QueuedQuery::new_with_attachments(
+            prompt,
+            QueuedQueryOrigin::LocalSteering,
+            attachments,
+        )
+        .with_timing(QueuedQueryTiming::NextTurn);
+        QueuedQueryModel::handle(ctx)
+            .update(ctx, |queue, ctx| queue.append(conversation_id, query, ctx));
         true
     }
 

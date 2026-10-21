@@ -2649,6 +2649,139 @@ fn seed_in_progress_conversation(
     conversation_id
 }
 
+#[test]
+fn local_steering_captures_attachments_without_changing_full_response_queueing() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        let steering = FeatureFlag::AgentPromptSteering.override_enabled(true);
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let id = seed_in_progress_conversation(&mut app, &terminal);
+        select_conversation(&mut app, &terminal, id);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .unqueued_prompt_behavior
+                .set_value(UnqueuedPromptBehavior::Steer, ctx)
+                .unwrap();
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(false, ctx);
+            input.execute_slash_command(
+                &commands::QUEUE,
+                Some(&"write tests".to_owned()),
+                SlashCommandTrigger::input(),
+                false,
+                None,
+                None,
+                ctx,
+            );
+            input.ai_context_model.update(ctx, |context, ctx| {
+                context.append_pending_attachments(
+                    vec![PendingAttachment::Image(ImageContext {
+                        data: "image".into(),
+                        mime_type: "image/png".into(),
+                        file_name: "diagram.png".into(),
+                        is_figma: false,
+                    })],
+                    ctx,
+                );
+            });
+            input.replace_buffer_content("do not modify X", ctx);
+            input.input_enter(ctx);
+            assert!(input.buffer_text(ctx).is_empty());
+            assert!(
+                input
+                    .ai_context_model
+                    .as_ref(ctx)
+                    .pending_attachments()
+                    .is_empty()
+            );
+            let queue = QueuedQueryModel::as_ref(ctx).queue(id);
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue[0].timing(), QueuedQueryTiming::AfterResponse);
+            assert_eq!(queue[1].timing(), QueuedQueryTiming::NextTurn);
+            assert_eq!(queue[1].attachments().len(), 1);
+            assert_eq!(
+                BlocklistAIHistoryModel::as_ref(ctx)
+                    .conversation(&id)
+                    .unwrap()
+                    .status(),
+                &ConversationStatus::InProgress
+            );
+        });
+        drop(steering);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .unqueued_prompt_behavior
+                .set_value(UnqueuedPromptBehavior::Interrupt, ctx)
+                .unwrap();
+        });
+        QueuedQueryModel::handle(&app).read(&app, |queue, _| {
+            assert_eq!(queue.queue(id)[1].timing(), QueuedQueryTiming::NextTurn);
+        });
+    });
+}
+
+#[test]
+fn local_steering_does_not_capture_interrupt_slash_idle_or_external_prompts() {
+    use crate::ai::agent::conversation_driver::ConversationDriver;
+    App::test((), |mut app| async move {
+        let _queue = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let id = seed_in_progress_conversation(&mut app, &terminal);
+        select_conversation(&mut app, &terminal, id);
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(false, ctx);
+            input.replace_buffer_content("prompt", ctx);
+            assert!(!input.maybe_steer_input_for_in_progress_conversation(ctx));
+        });
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .unqueued_prompt_behavior
+                .set_value(UnqueuedPromptBehavior::Steer, ctx)
+                .unwrap();
+        });
+        {
+            let _flag_off = FeatureFlag::AgentPromptSteering.override_enabled(false);
+            input.update(&mut app, |input, ctx| {
+                assert!(!input.maybe_steer_input_for_in_progress_conversation(ctx));
+                assert_eq!(input.buffer_text(ctx), "prompt");
+            });
+        }
+        let _steering = FeatureFlag::AgentPromptSteering.override_enabled(true);
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("/compact", ctx);
+            assert!(!input.maybe_steer_input_for_in_progress_conversation(ctx));
+            input.replace_buffer_content("prompt", ctx);
+        });
+        for driver in [
+            ConversationDriver::ExternalHarness,
+            ConversationDriver::SharedSessionViewer,
+        ] {
+            BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, _| {
+                history.conversation_mut(&id).unwrap().set_driver(driver)
+            });
+            input.update(&mut app, |input, ctx| {
+                assert!(!input.maybe_steer_input_for_in_progress_conversation(ctx))
+            });
+        }
+        BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, _| {
+            let conversation = history.conversation_mut(&id).unwrap();
+            conversation.set_driver(ConversationDriver::Native);
+            conversation.set_status_for_test(ConversationStatus::Success);
+        });
+        input.update(&mut app, |input, ctx| {
+            assert!(!input.maybe_steer_input_for_in_progress_conversation(ctx));
+            assert_eq!(input.buffer_text(ctx), "prompt");
+        });
+    });
+}
+
 /// Puts the active block into the agent-requested, agent-in-control LRC state.
 fn simulate_agent_requested_lrc(
     app: &mut App,

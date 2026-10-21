@@ -585,6 +585,8 @@ pub mod flags {
         "Orchestration_Message_Display_AlwaysCollapse";
     pub const PROMPT_SUBMISSION_INTERRUPT: &str = "Prompt_Submission_Interrupt";
     pub const PROMPT_SUBMISSION_QUEUE: &str = "Prompt_Submission_Queue";
+    pub const UNQUEUED_PROMPT_INTERRUPT: &str = "Unqueued_Prompt_Interrupt";
+    pub const UNQUEUED_PROMPT_STEER: &str = "Unqueued_Prompt_Steer";
     pub const LRC_SUBMISSION_SEND_IMMEDIATELY: &str = "LRC_Submission_Send_Immediately";
     pub const LRC_SUBMISSION_QUEUE_UNTIL_COMMAND_COMPLETES: &str =
         "LRC_Submission_Queue_Until_Command_Completes";

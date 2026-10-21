@@ -23754,6 +23754,15 @@ impl Workspace {
             }
         }
 
+        match ai_settings.unqueued_prompt_behavior {
+            crate::settings::UnqueuedPromptBehavior::Interrupt => {
+                context.set.insert(flags::UNQUEUED_PROMPT_INTERRUPT);
+            }
+            crate::settings::UnqueuedPromptBehavior::Steer => {
+                context.set.insert(flags::UNQUEUED_PROMPT_STEER);
+            }
+        }
+
         match ai_settings.long_running_command_submission_mode {
             crate::settings::LongRunningCommandSubmissionMode::SendImmediately => {
                 context.set.insert(flags::LRC_SUBMISSION_SEND_IMMEDIATELY);

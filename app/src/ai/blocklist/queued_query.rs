@@ -25,9 +25,10 @@ impl QueuedQueryId {
 }
 
 /// Where a queued prompt came from.
-/// The origin is informational for telemetry; FIFO ordering and firing semantics are uniform.
+/// The origin is informational for telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedQueryOrigin {
+    LocalSteering,
     /// Filed while the initial Cloud Mode prompt waits to be handed off.
     InitialCloudMode,
     /// Received through session sharing while a native run was starting.
@@ -75,8 +76,16 @@ pub struct QueuedQuery {
     text: String,
     origin: QueuedQueryOrigin,
     kind: QueuedQueryKind,
+    timing: QueuedQueryTiming,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum QueuedQueryTiming {
+    #[default]
+    InheritConversation,
+    AfterResponse,
+    NextTurn,
+}
 impl QueuedQuery {
     pub(crate) fn new_shared_session_prompt(
         text: String,
@@ -92,6 +101,7 @@ impl QueuedQuery {
             id: QueuedQueryId::new(),
             text,
             origin: QueuedQueryOrigin::SharedSessionInjection,
+            timing: QueuedQueryTiming::InheritConversation,
             kind: QueuedQueryKind::SharedSessionPrompt {
                 participant_id,
                 attachments,
@@ -134,6 +144,7 @@ impl QueuedQuery {
             text,
             origin,
             kind: QueuedQueryKind::Prompt { attachments },
+            timing: QueuedQueryTiming::InheritConversation,
         }
     }
 
@@ -144,11 +155,21 @@ impl QueuedQuery {
             text,
             origin,
             kind: QueuedQueryKind::Command,
+            timing: QueuedQueryTiming::InheritConversation,
         }
     }
 
     pub fn id(&self) -> QueuedQueryId {
         self.id
+    }
+
+    pub(crate) fn with_timing(mut self, timing: QueuedQueryTiming) -> Self {
+        self.timing = timing;
+        self
+    }
+
+    pub(crate) fn timing(&self) -> QueuedQueryTiming {
+        self.timing
     }
 
     /// Whether all asynchronous preparation for this row has settled.
@@ -450,6 +471,28 @@ impl QueuedQueryModel {
             return None;
         }
         self.ready_query(conversation_id, first.id)
+    }
+
+    pub(crate) fn ready_next_turn(
+        &self,
+        conversation_id: AIConversationId,
+    ) -> Option<&QueuedQuery> {
+        if self.is_dispatch_blocked(conversation_id) || self.has_command_in_flight(conversation_id)
+        {
+            return None;
+        }
+        let row = self.queue(conversation_id).iter().find(|row| {
+            row.is_locked()
+                || row.is_command()
+                || matches!(row.origin, QueuedQueryOrigin::LrcAutoQueue)
+                || row.timing == QueuedQueryTiming::NextTurn
+        })?;
+        if row.timing != QueuedQueryTiming::NextTurn
+            || self.editing_row(conversation_id) == Some(row.id)
+        {
+            return None;
+        }
+        self.ready_query(conversation_id, row.id)
     }
 
     /// Settles attachment preparation once; stale completions never recreate removed rows.

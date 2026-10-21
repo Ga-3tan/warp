@@ -101,8 +101,8 @@ use crate::settings::{
     NLDInTerminalEnabled, NaturalLanguageAutosuggestionsEnabled, OrchestrationMessageDisplayMode,
     PromptSubmissionMode, SharedBlockTitleGenerationEnabled,
     ShouldRenderUseAgentToolbarForUserCommands, ShouldShowOzUpdatesInZeroState, ShowAgentTips,
-    ShowConversationHistory, ShowHintText, ThinkingDisplayMode, VOICE_INPUT_LANGUAGES,
-    VoiceInputEnabled, VoiceInputLanguage, VoiceInputToggleKey,
+    ShowConversationHistory, ShowHintText, ThinkingDisplayMode, UnqueuedPromptBehavior,
+    VOICE_INPUT_LANGUAGES, VoiceInputEnabled, VoiceInputLanguage, VoiceInputToggleKey,
 };
 use crate::ui_components::blended_colors;
 use crate::ui_components::icons::Icon;
@@ -411,6 +411,28 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             .collect();
         app.register_fixed_bindings(lrc_mode_bindings);
     }
+    if FeatureFlag::AgentPromptSteering.is_enabled() && FeatureFlag::QueueSlashCommand.is_enabled()
+    {
+        use warpui::keymap::FixedBinding;
+        app.register_fixed_bindings(
+            UnqueuedPromptBehavior::iter()
+                .map(|mode| {
+                    let context_flag = match mode {
+                        UnqueuedPromptBehavior::Interrupt => flags::UNQUEUED_PROMPT_INTERRUPT,
+                        UnqueuedPromptBehavior::Steer => flags::UNQUEUED_PROMPT_STEER,
+                    };
+                    FixedBinding::empty(
+                        mode.command_palette_description(),
+                        builder(SettingsAction::WarpAgent(
+                            WarpAgentPageAction::SetUnqueuedPromptBehavior(mode),
+                        )),
+                        context.clone() & id!(flags::IS_ANY_AI_ENABLED) & !id!(context_flag),
+                    )
+                    .with_group(bindings::BindingGroup::WarpAi.as_str())
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
     ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(
         vec![
             ToggleSettingActionPair::new(
@@ -660,6 +682,7 @@ pub struct WarpAgentPageView {
     thinking_display_mode_dropdown: ViewHandle<Dropdown<WarpAgentPageAction>>,
     orchestration_message_display_mode_dropdown: ViewHandle<Dropdown<WarpAgentPageAction>>,
     default_prompt_submission_mode_dropdown: ViewHandle<Dropdown<WarpAgentPageAction>>,
+    unqueued_prompt_behavior_dropdown: ViewHandle<Dropdown<WarpAgentPageAction>>,
     lrc_submission_mode_dropdown: ViewHandle<Dropdown<WarpAgentPageAction>>,
     #[cfg(feature = "local_fs")]
     conversation_layout_dropdown: ViewHandle<Dropdown<WarpAgentPageAction>>,
@@ -810,6 +833,30 @@ impl WarpAgentPageView {
             });
         }
 
+        let unqueued_prompt_behavior_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.add_items(
+                UnqueuedPromptBehavior::iter()
+                    .map(|mode| {
+                        DropdownItem::new(
+                            mode.display_name(),
+                            WarpAgentPageAction::SetUnqueuedPromptBehavior(mode),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown.set_selected_by_action(
+                WarpAgentPageAction::SetUnqueuedPromptBehavior(
+                    AISettings::as_ref(ctx).unqueued_prompt_behavior,
+                ),
+                ctx,
+            );
+            dropdown
+        });
+
         let lrc_submission_mode_dropdown = OtherAIWidget::create_lrc_submission_mode_dropdown(ctx);
         {
             let current_mode = AISettings::as_ref(ctx).long_running_command_submission_mode;
@@ -952,6 +999,16 @@ impl WarpAgentPageView {
                         .update(ctx, |dropdown, ctx| {
                             dropdown.set_selected_by_action(
                                 WarpAgentPageAction::SetPromptSubmissionMode(current_mode),
+                                ctx,
+                            );
+                        });
+                }
+                AISettingsChangedEvent::UnqueuedPromptBehavior { .. } => {
+                    let mode = AISettings::as_ref(ctx).unqueued_prompt_behavior;
+                    me.unqueued_prompt_behavior_dropdown
+                        .update(ctx, |dropdown, ctx| {
+                            dropdown.set_selected_by_action(
+                                WarpAgentPageAction::SetUnqueuedPromptBehavior(mode),
                                 ctx,
                             );
                         });
@@ -1222,6 +1279,7 @@ impl WarpAgentPageView {
             thinking_display_mode_dropdown,
             orchestration_message_display_mode_dropdown,
             default_prompt_submission_mode_dropdown,
+            unqueued_prompt_behavior_dropdown,
             lrc_submission_mode_dropdown,
             #[cfg(feature = "local_fs")]
             conversation_layout_dropdown,
@@ -2326,18 +2384,21 @@ impl WarpAgentPageView {
             ));
         }
 
-        categories.push(Category::new(
-            "Input",
-            vec![
-                Box::new(NaturalLanguageDetectionWidget::default()),
-                Box::new(ShowInputHintTextWidget::default()),
-                Box::new(AiCommandSearchHashTriggerWidget::default()),
-                Box::new(ShowAgentTipsWidget::default()),
-                Box::new(IncludeAgentCommandsInHistoryWidget::default()),
-                Box::new(AutoApproveBypassesCommandDenylistWidget::default()),
-                Box::new(PromptSubmissionModeWidget),
-            ],
-        ));
+        let mut input_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![
+            Box::new(NaturalLanguageDetectionWidget::default()),
+            Box::new(ShowInputHintTextWidget::default()),
+            Box::new(AiCommandSearchHashTriggerWidget::default()),
+            Box::new(ShowAgentTipsWidget::default()),
+            Box::new(IncludeAgentCommandsInHistoryWidget::default()),
+            Box::new(AutoApproveBypassesCommandDenylistWidget::default()),
+            Box::new(PromptSubmissionModeWidget),
+        ];
+        if FeatureFlag::AgentPromptSteering.is_enabled()
+            && FeatureFlag::QueueSlashCommand.is_enabled()
+        {
+            input_widgets.push(Box::new(UnqueuedPromptBehaviorWidget));
+        }
+        categories.push(Category::new("Input", input_widgets));
 
         let voice_supported = cfg!(feature = "voice_input")
             && ai_settings
@@ -2563,6 +2624,7 @@ pub enum WarpAgentPageAction {
     SetThinkingDisplayMode(ThinkingDisplayMode),
     SetOrchestrationMessageDisplayMode(OrchestrationMessageDisplayMode),
     SetPromptSubmissionMode(PromptSubmissionMode),
+    SetUnqueuedPromptBehavior(UnqueuedPromptBehavior),
     SetLongRunningCommandSubmissionMode(LongRunningCommandSubmissionMode),
     SignupAnonymousUser,
     ToggleAwsBedrockAutoLogin,
@@ -2967,6 +3029,15 @@ impl TypedActionView for WarpAgentPageView {
                     );
                 });
                 ctx.notify();
+            }
+            WarpAgentPageAction::SetUnqueuedPromptBehavior(mode) => {
+                if FeatureFlag::AgentPromptSteering.is_enabled()
+                    && FeatureFlag::QueueSlashCommand.is_enabled()
+                {
+                    AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(settings.unqueued_prompt_behavior.set_value(*mode, ctx));
+                    });
+                }
             }
             WarpAgentPageAction::SetLongRunningCommandSubmissionMode(mode) => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
@@ -3940,6 +4011,42 @@ impl SettingsWidget for PromptSubmissionModeWidget {
         }
 
         column.finish()
+    }
+}
+
+#[derive(Default)]
+struct UnqueuedPromptBehaviorWidget;
+
+impl SettingsWidget for UnqueuedPromptBehaviorWidget {
+    type View = WarpAgentPageView;
+
+    fn search_terms(&self) -> &str {
+        "unqueued prompt behavior interrupt steer next turn local agent"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Unqueued prompt behavior",
+            Some(
+                "For local Warp Agent prompts when auto-queue is off. Interrupt sends immediately. Steer waits for the next turn. Queued prompts still wait until the full response finishes.",
+            ),
+            None,
+            LocalOnlyIconState::for_setting(
+                UnqueuedPromptBehavior::storage_key(),
+                UnqueuedPromptBehavior::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            (!AISettings::as_ref(app).is_any_ai_enabled(app))
+                .then(|| appearance.theme().disabled_ui_text_color()),
+            &view.unqueued_prompt_behavior_dropdown,
+        )
     }
 }
 

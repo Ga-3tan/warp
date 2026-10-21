@@ -11,7 +11,7 @@ use warpui::{App, SingletonEntity};
 
 use super::{
     AutofireAction, QueuedQuery, QueuedQueryEvent, QueuedQueryId, QueuedQueryModel,
-    QueuedQueryOrigin,
+    QueuedQueryOrigin, QueuedQueryTiming,
 };
 use crate::ai::agent::ImageContext;
 use crate::ai::agent::conversation::AIConversationId;
@@ -46,6 +46,108 @@ where
 
 fn user_query(text: &str) -> QueuedQuery {
     QueuedQuery::new(text.to_owned(), QueuedQueryOrigin::QueueSlashCommand)
+}
+
+#[test]
+fn next_turn_lane_bypasses_response_rows_but_preserves_its_own_order() {
+    with_model(|mut app, model, _| {
+        let id = AIConversationId::new();
+        model.update(&mut app, |queue, ctx| {
+            let response = queue.append(
+                id,
+                user_query("after response").with_timing(QueuedQueryTiming::AfterResponse),
+                ctx,
+            );
+            let first = queue.append(
+                id,
+                user_query("first correction").with_timing(QueuedQueryTiming::NextTurn),
+                ctx,
+            );
+            let second = queue.append(
+                id,
+                user_query("second correction").with_timing(QueuedQueryTiming::NextTurn),
+                ctx,
+            );
+            assert_eq!(queue.ready_next_turn(id).unwrap().id(), first);
+            assert_eq!(queue.ready_head(id).unwrap().id(), response);
+            queue.enter_edit_mode(id, first, ctx);
+            assert!(queue.ready_next_turn(id).is_none());
+            queue.cancel_edit(id, ctx);
+            queue.reorder(id, second, 1, ctx);
+            assert_eq!(queue.ready_next_turn(id).unwrap().id(), second);
+            let row = queue.remove_by_id(id, second, ctx).unwrap();
+            queue.restore_fired_row(id, 1, row.clone(), ctx);
+            queue.restore_fired_row(id, 1, row, ctx);
+            assert_eq!(queue.queue(id).len(), 3);
+            assert_eq!(
+                queue.ready_next_turn(id).unwrap().timing(),
+                QueuedQueryTiming::NextTurn
+            );
+            queue.remove_fired_row(id, second, ctx);
+            assert_eq!(queue.ready_next_turn(id).unwrap().id(), first);
+        });
+    });
+}
+
+#[test]
+fn next_turn_lane_waits_for_preparation_and_safety_holds() {
+    with_model(|mut app, model, _| {
+        let id = AIConversationId::new();
+        model.update(&mut app, |queue, ctx| {
+            let first = queue.append(
+                id,
+                QueuedQuery::new_shared_session_prompt(
+                    "preparing".into(),
+                    ParticipantId::new(),
+                    vec![AgentAttachment::FileReference {
+                        attachment_id: "file".into(),
+                        file_name: "file".into(),
+                    }],
+                    None,
+                )
+                .with_timing(QueuedQueryTiming::NextTurn),
+                ctx,
+            );
+            queue.append(
+                id,
+                user_query("ready").with_timing(QueuedQueryTiming::NextTurn),
+                ctx,
+            );
+            assert!(queue.ready_next_turn(id).is_none());
+            queue.complete_preparation(id, first, HashMap::new(), ctx);
+            assert_eq!(queue.ready_next_turn(id).unwrap().id(), first);
+            queue.begin_native_setup(id, ctx);
+            assert!(queue.ready_next_turn(id).is_none());
+            queue.finish_native_setup(id, ctx);
+            queue.arm_command_in_flight(id);
+            assert!(queue.ready_next_turn(id).is_none());
+            queue.clear_command_in_flight(id);
+            assert_eq!(queue.ready_next_turn(id).unwrap().id(), first);
+        });
+    });
+}
+
+#[test]
+fn next_turn_lane_does_not_bypass_command_or_locked_rows() {
+    with_model(|mut app, model, _| {
+        for barrier in [
+            initial_cloud_mode_query("setup"),
+            command_query("sleep 1"),
+            QueuedQuery::new("pending".into(), QueuedQueryOrigin::PendingLrcAutoQueue),
+            QueuedQuery::new("command finish".into(), QueuedQueryOrigin::LrcAutoQueue),
+        ] {
+            let id = AIConversationId::new();
+            model.update(&mut app, |queue, ctx| {
+                queue.append(id, barrier, ctx);
+                queue.append(
+                    id,
+                    user_query("correction").with_timing(QueuedQueryTiming::NextTurn),
+                    ctx,
+                );
+                assert!(queue.ready_next_turn(id).is_none());
+            });
+        }
+    });
 }
 
 #[test]
