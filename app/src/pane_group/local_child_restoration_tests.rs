@@ -214,6 +214,17 @@ fn restored_local_child_subtree_startup_gate() {
                 child.run_id().unwrap(),
             )
         });
+        let _task = ChannelState::mock_server()
+            .mock("GET", format!("/api/v1/agent/runs/{recipient}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::to_string(&ambient_agent_task_for_current_user(
+                    recipient.parse().unwrap(),
+                ))
+                .unwrap(),
+            )
+            .create();
         OrchestrationEventService::handle(&app).update(&mut app, |service, ctx| {
             service.enqueue_event_batch(
                 fixture.child_id,
