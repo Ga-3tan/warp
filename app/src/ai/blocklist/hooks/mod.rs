@@ -708,18 +708,18 @@ pub(crate) mod testing {
                         .clone();
                     history
                         .update_conversation_for_new_request_input_for_test(
-                                RequestInput {
-                                    conversation_id,
-                                    input_messages: Vec::from([(task_id, vec![])]),
-                                    working_directory: None,
-                                    model_id: LLMId::from("test-model"),
-                                    coding_model_id: LLMId::from("test-coding-model"),
-                                    cli_agent_model_id: LLMId::from("test-cli-agent-model"),
-                                    computer_use_model_id: LLMId::from("test-computer-use-model"),
-                                    shared_session_response_initiator: None,
-                                    request_start_ts: Local::now(),
-                                    supported_tools_override: None,
-                                },
+                            RequestInput {
+                                conversation_id,
+                                input_messages: Vec::from([(task_id, vec![])]),
+                                working_directory: None,
+                                model_id: LLMId::from("test-model"),
+                                coding_model_id: LLMId::from("test-coding-model"),
+                                cli_agent_model_id: LLMId::from("test-cli-agent-model"),
+                                computer_use_model_id: LLMId::from("test-computer-use-model"),
+                                shared_session_response_initiator: None,
+                                request_start_ts: Local::now(),
+                                supported_tools_override: None,
+                            },
                             stream_id.clone(),
                             terminal_surface_id,
                             ctx,
