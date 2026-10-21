@@ -1265,7 +1265,7 @@ impl AgentDriver {
             .clone()
             .unwrap_or_else(parse_skills_dirs_env);
         let hook_dirs = hooks::hook_dirs(
-            hooks::hook_dirs_env_value().as_deref(),
+            hooks::hook_dirs_env_value(&resolved_env_vars).as_deref(),
             &hook_options.extra_dirs,
         );
 
@@ -1450,7 +1450,10 @@ impl AgentDriver {
             cloud_providers: Vec::new(),
             workspace: Some(environment::WorkspaceConfiguration::default()),
             skill_dirs: parse_skills_dirs_env(),
-            hook_dirs: hooks::hook_dirs(hooks::hook_dirs_env_value().as_deref(), &[]),
+            hook_dirs: hooks::hook_dirs(
+                hooks::hook_dirs_env_value(&HashMap::new()).as_deref(),
+                &[],
+            ),
             hook_options: hooks::HookRunOptions::default(),
             factory_repository_contract: false,
             computer_use_configured: false,
