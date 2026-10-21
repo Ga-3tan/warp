@@ -11,7 +11,7 @@ use warpui::{App, SingletonEntity};
 
 use super::{
     AutofireAction, QueuedQuery, QueuedQueryEvent, QueuedQueryId, QueuedQueryModel,
-    QueuedQueryOrigin, QueuedQueryTiming,
+    QueuedQueryOrigin,
 };
 use crate::ai::agent::ImageContext;
 use crate::ai::agent::conversation::AIConversationId;
@@ -48,87 +48,38 @@ fn user_query(text: &str) -> QueuedQuery {
     QueuedQuery::new(text.to_owned(), QueuedQueryOrigin::QueueSlashCommand)
 }
 
+fn steering_query(text: &str) -> QueuedQuery {
+    QueuedQuery::new(text.to_owned(), QueuedQueryOrigin::LocalSteering)
+}
+
 #[test]
-fn next_turn_lane_bypasses_response_rows_but_preserves_its_own_order() {
+fn steering_row_passes_plain_prompts_but_keeps_its_own_order_and_edit_hold() {
     with_model(|mut app, model, _| {
         let id = AIConversationId::new();
         model.update(&mut app, |queue, ctx| {
-            let response = queue.append(
-                id,
-                user_query("after response").with_timing(QueuedQueryTiming::AfterResponse),
-                ctx,
-            );
-            let first = queue.append(
-                id,
-                user_query("first correction").with_timing(QueuedQueryTiming::NextTurn),
-                ctx,
-            );
-            let second = queue.append(
-                id,
-                user_query("second correction").with_timing(QueuedQueryTiming::NextTurn),
-                ctx,
-            );
-            assert_eq!(queue.ready_next_turn(id).unwrap().id(), first);
+            let response = queue.append(id, user_query("after response"), ctx);
+            let first = queue.append(id, steering_query("first correction"), ctx);
+            let second = queue.append(id, steering_query("second correction"), ctx);
+            assert_eq!(queue.ready_local_steering_row(id).unwrap().id(), first);
             assert_eq!(queue.ready_head(id).unwrap().id(), response);
             queue.enter_edit_mode(id, first, ctx);
-            assert!(queue.ready_next_turn(id).is_none());
+            assert!(queue.ready_local_steering_row(id).is_none());
             queue.cancel_edit(id, ctx);
             queue.reorder(id, second, 1, ctx);
-            assert_eq!(queue.ready_next_turn(id).unwrap().id(), second);
-            let row = queue.remove_by_id(id, second, ctx).unwrap();
-            queue.restore_fired_row(id, 1, row.clone(), ctx);
-            queue.restore_fired_row(id, 1, row, ctx);
-            assert_eq!(queue.queue(id).len(), 3);
-            assert_eq!(
-                queue.ready_next_turn(id).unwrap().timing(),
-                QueuedQueryTiming::NextTurn
-            );
-            queue.remove_fired_row(id, second, ctx);
-            assert_eq!(queue.ready_next_turn(id).unwrap().id(), first);
-        });
-    });
-}
-
-#[test]
-fn next_turn_lane_waits_for_preparation_and_safety_holds() {
-    with_model(|mut app, model, _| {
-        let id = AIConversationId::new();
-        model.update(&mut app, |queue, ctx| {
-            let first = queue.append(
-                id,
-                QueuedQuery::new_shared_session_prompt(
-                    "preparing".into(),
-                    ParticipantId::new(),
-                    vec![AgentAttachment::FileReference {
-                        attachment_id: "file".into(),
-                        file_name: "file".into(),
-                    }],
-                    None,
-                )
-                .with_timing(QueuedQueryTiming::NextTurn),
-                ctx,
-            );
-            queue.append(
-                id,
-                user_query("ready").with_timing(QueuedQueryTiming::NextTurn),
-                ctx,
-            );
-            assert!(queue.ready_next_turn(id).is_none());
-            queue.complete_preparation(id, first, HashMap::new(), ctx);
-            assert_eq!(queue.ready_next_turn(id).unwrap().id(), first);
+            assert_eq!(queue.ready_local_steering_row(id).unwrap().id(), second);
             queue.begin_native_setup(id, ctx);
-            assert!(queue.ready_next_turn(id).is_none());
+            assert!(queue.ready_local_steering_row(id).is_none());
             queue.finish_native_setup(id, ctx);
             queue.arm_command_in_flight(id);
-            assert!(queue.ready_next_turn(id).is_none());
+            assert!(queue.ready_local_steering_row(id).is_none());
             queue.clear_command_in_flight(id);
-            assert_eq!(queue.ready_next_turn(id).unwrap().id(), first);
+            assert_eq!(queue.ready_local_steering_row(id).unwrap().id(), second);
         });
     });
 }
 
 #[test]
-fn next_turn_lane_does_not_bypass_command_or_locked_rows() {
+fn steering_row_does_not_pass_command_or_locked_rows() {
     with_model(|mut app, model, _| {
         for barrier in [
             initial_cloud_mode_query("setup"),
@@ -139,12 +90,50 @@ fn next_turn_lane_does_not_bypass_command_or_locked_rows() {
             let id = AIConversationId::new();
             model.update(&mut app, |queue, ctx| {
                 queue.append(id, barrier, ctx);
-                queue.append(
-                    id,
-                    user_query("correction").with_timing(QueuedQueryTiming::NextTurn),
-                    ctx,
-                );
-                assert!(queue.ready_next_turn(id).is_none());
+                queue.append(id, steering_query("correction"), ctx);
+                assert!(queue.ready_local_steering_row(id).is_none());
+            });
+        }
+    });
+}
+
+#[test]
+fn effective_mode_applies_the_binary_toggle_on_top_of_each_default() {
+    use settings::Setting;
+
+    use crate::settings::{AISettings, PromptSubmissionMode};
+    with_model(|mut app, model, _| {
+        let id = AIConversationId::new();
+        for (default, toggled_once, toggled_twice) in [
+            (
+                PromptSubmissionMode::Interrupt,
+                PromptSubmissionMode::Queue,
+                PromptSubmissionMode::Interrupt,
+            ),
+            (
+                PromptSubmissionMode::Steer,
+                PromptSubmissionMode::Queue,
+                PromptSubmissionMode::Steer,
+            ),
+            (
+                PromptSubmissionMode::Queue,
+                PromptSubmissionMode::Interrupt,
+                PromptSubmissionMode::Queue,
+            ),
+        ] {
+            AISettings::handle(&app).update(&mut app, |settings, ctx| {
+                settings
+                    .default_prompt_submission_mode
+                    .set_value(default, ctx)
+                    .unwrap();
+            });
+            model.update(&mut app, |queue, ctx| {
+                queue.queues.remove(&id);
+                assert_eq!(queue.effective_prompt_submission_mode(id), default);
+                queue.toggle_queue_next_prompt(id, ctx);
+                assert_eq!(queue.effective_prompt_submission_mode(id), toggled_once);
+                queue.toggle_queue_next_prompt(id, ctx);
+                assert_eq!(queue.effective_prompt_submission_mode(id), toggled_twice);
             });
         }
     });

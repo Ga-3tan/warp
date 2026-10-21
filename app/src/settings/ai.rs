@@ -936,6 +936,9 @@ pub enum PromptSubmissionMode {
     /// (default).
     #[default]
     Interrupt,
+    /// Hold the new prompt until the agent's next request within the current turn (e.g. after
+    /// a tool result), so it lands mid-task without cancelling in-flight work.
+    Steer,
     /// Hold the new prompt until the in-flight response finishes, then submit.
     Queue,
 }
@@ -957,6 +960,7 @@ impl PromptSubmissionMode {
     pub fn display_name(&self) -> &'static str {
         match self {
             PromptSubmissionMode::Interrupt => "Interrupt response",
+            PromptSubmissionMode::Steer => "Steer at next turn",
             PromptSubmissionMode::Queue => "Queue until response finishes",
         }
     }
@@ -964,56 +968,18 @@ impl PromptSubmissionMode {
     pub fn command_palette_description(&self) -> &'static str {
         match self {
             PromptSubmissionMode::Interrupt => "Set default prompt submission: interrupt response",
+            PromptSubmissionMode::Steer => "Set default prompt submission: steer at next turn",
             PromptSubmissionMode::Queue => {
                 "Set default prompt submission: queue until response finishes"
             }
         }
     }
-}
 
-#[derive(
-    Default,
-    Debug,
-    serde::Serialize,
-    serde::Deserialize,
-    PartialEq,
-    Copy,
-    Clone,
-    EnumIter,
-    schemars::JsonSchema,
-    settings_value::SettingsValue,
-)]
-#[schemars(rename_all = "snake_case")]
-pub enum UnqueuedPromptBehavior {
-    #[default]
-    Interrupt,
-    Steer,
-}
-
-settings::macros::implement_setting_for_enum!(
-    UnqueuedPromptBehavior,
-    AISettings,
-    SupportedPlatforms::DESKTOP,
-    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
-    surface: settings::SettingSurfaces::GUI,
-    private: false,
-    toml_path: "agents.warp_agent.other.unqueued_prompt_behavior",
-    description: "Behavior of local prompts when full-response queueing is off.",
-    feature_flag: FeatureFlag::AgentPromptSteering,
-);
-
-impl UnqueuedPromptBehavior {
-    pub fn display_name(&self) -> &'static str {
+    /// Whether this mode can currently be offered to the user.
+    pub fn is_available(&self) -> bool {
         match self {
-            Self::Interrupt => "Interrupt",
-            Self::Steer => "Steer",
-        }
-    }
-
-    pub fn command_palette_description(&self) -> &'static str {
-        match self {
-            Self::Interrupt => "Set unqueued prompt behavior: interrupt",
-            Self::Steer => "Set unqueued prompt behavior: steer",
+            PromptSubmissionMode::Interrupt | PromptSubmissionMode::Queue => true,
+            PromptSubmissionMode::Steer => FeatureFlag::AgentPromptSteering.is_enabled(),
         }
     }
 }
@@ -1021,9 +987,8 @@ impl UnqueuedPromptBehavior {
 /// What happens when a prompt is submitted while an agent controls an agent-requested
 /// long-running command (LRC).
 ///
-/// Only consulted when [`PromptSubmissionMode`] is `Interrupt`: in `Queue` mode
-/// prompts always queue until the full response finishes, so this setting is
-/// hidden and ignored.
+/// Not consulted when [`PromptSubmissionMode`] is `Queue`: prompts then always queue until
+/// the full response finishes, so this setting is hidden and ignored.
 #[derive(
     Default,
     Debug,
@@ -2115,10 +2080,9 @@ define_settings_group!(AISettings, settings: [
     // responding. Per-conversation overrides live on `QueuedQueryModel`; this
     // setting is the fallback used when a conversation has no explicit override.
     default_prompt_submission_mode: PromptSubmissionMode,
-    unqueued_prompt_behavior: UnqueuedPromptBehavior,
 
     // What happens when a prompt is submitted while an agent controls an agent-requested
-    // long-running command. Only consulted when `default_prompt_submission_mode` is `Interrupt`;
+    // long-running command. Not consulted when `default_prompt_submission_mode` is `Queue`;
     // per-LRC manual overrides live on `QueuedQueryModel`.
     long_running_command_submission_mode: LongRunningCommandSubmissionMode,
 

@@ -25,9 +25,10 @@ impl QueuedQueryId {
 }
 
 /// Where a queued prompt came from.
-/// The origin is informational for telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedQueryOrigin {
+    /// Filed by the local input in `Steer` mode while the agent was mid-turn. Fires on the next
+    /// request boundary of the current turn rather than waiting for the turn to finish.
     LocalSteering,
     /// Filed while the initial Cloud Mode prompt waits to be handed off.
     InitialCloudMode,
@@ -76,16 +77,8 @@ pub struct QueuedQuery {
     text: String,
     origin: QueuedQueryOrigin,
     kind: QueuedQueryKind,
-    timing: QueuedQueryTiming,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum QueuedQueryTiming {
-    #[default]
-    InheritConversation,
-    AfterResponse,
-    NextTurn,
-}
 impl QueuedQuery {
     pub(crate) fn new_shared_session_prompt(
         text: String,
@@ -101,7 +94,6 @@ impl QueuedQuery {
             id: QueuedQueryId::new(),
             text,
             origin: QueuedQueryOrigin::SharedSessionInjection,
-            timing: QueuedQueryTiming::InheritConversation,
             kind: QueuedQueryKind::SharedSessionPrompt {
                 participant_id,
                 attachments,
@@ -144,7 +136,6 @@ impl QueuedQuery {
             text,
             origin,
             kind: QueuedQueryKind::Prompt { attachments },
-            timing: QueuedQueryTiming::InheritConversation,
         }
     }
 
@@ -155,7 +146,6 @@ impl QueuedQuery {
             text,
             origin,
             kind: QueuedQueryKind::Command,
-            timing: QueuedQueryTiming::InheritConversation,
         }
     }
 
@@ -163,13 +153,10 @@ impl QueuedQuery {
         self.id
     }
 
-    pub(crate) fn with_timing(mut self, timing: QueuedQueryTiming) -> Self {
-        self.timing = timing;
-        self
-    }
-
-    pub(crate) fn timing(&self) -> QueuedQueryTiming {
-        self.timing
+    /// Whether this row fires at the next request boundary of the current turn rather than
+    /// waiting for the turn to finish.
+    pub(crate) fn is_local_steering(&self) -> bool {
+        self.origin == QueuedQueryOrigin::LocalSteering
     }
 
     /// Whether all asynchronous preparation for this row has settled.
@@ -473,23 +460,23 @@ impl QueuedQueryModel {
         self.ready_query(conversation_id, first.id)
     }
 
-    pub(crate) fn ready_next_turn(
+    /// Returns the first local steering row when nothing ahead of it must fire first. Plain
+    /// prompts wait for the turn to finish, so a steering row may pass them; commands, locked
+    /// rows, and LRC auto-queue rows are ordering barriers.
+    pub(crate) fn ready_local_steering_row(
         &self,
         conversation_id: AIConversationId,
     ) -> Option<&QueuedQuery> {
-        if self.is_dispatch_blocked(conversation_id) || self.has_command_in_flight(conversation_id)
-        {
+        if self.has_command_in_flight(conversation_id) {
             return None;
         }
         let row = self.queue(conversation_id).iter().find(|row| {
             row.is_locked()
                 || row.is_command()
-                || matches!(row.origin, QueuedQueryOrigin::LrcAutoQueue)
-                || row.timing == QueuedQueryTiming::NextTurn
+                || row.origin == QueuedQueryOrigin::LrcAutoQueue
+                || row.is_local_steering()
         })?;
-        if row.timing != QueuedQueryTiming::NextTurn
-            || self.editing_row(conversation_id) == Some(row.id)
-        {
+        if !row.is_local_steering() || self.editing_row(conversation_id) == Some(row.id) {
             return None;
         }
         self.ready_query(conversation_id, row.id)
@@ -775,10 +762,25 @@ impl QueuedQueryModel {
         &self,
         conversation_id: AIConversationId,
     ) -> bool {
-        self.queues
+        self.effective_prompt_submission_mode(conversation_id) == PromptSubmissionMode::Queue
+    }
+
+    /// The submission mode in effect for `conversation_id` once its auto-queue toggle is
+    /// applied on top of the default. The toggle is binary, so turning it off on a `Queue`
+    /// default falls back to `Interrupt`; on any other default it restores that default.
+    pub(crate) fn effective_prompt_submission_mode(
+        &self,
+        conversation_id: AIConversationId,
+    ) -> PromptSubmissionMode {
+        let queue_override = self
+            .queues
             .get(&conversation_id)
-            .and_then(|state| state.queue_next_prompt_override)
-            .unwrap_or(self.default_mode == PromptSubmissionMode::Queue)
+            .and_then(|state| state.queue_next_prompt_override);
+        match (queue_override, self.default_mode) {
+            (Some(true), _) => PromptSubmissionMode::Queue,
+            (Some(false), PromptSubmissionMode::Queue) => PromptSubmissionMode::Interrupt,
+            (Some(false), default) | (None, default) => default,
+        }
     }
 
     /// Toggles the per-conversation auto-queue state. Computes the effective
@@ -1220,12 +1222,17 @@ pub(crate) fn is_lrc_auto_queue_active(
 ) -> bool {
     let ai_settings = AISettings::as_ref(app);
     FeatureFlag::QueueSlashCommand.is_enabled()
-        && ai_settings.default_prompt_submission_mode == PromptSubmissionMode::Interrupt
+        && ai_settings.default_prompt_submission_mode != PromptSubmissionMode::Queue
         && ai_settings.long_running_command_submission_mode
             == LongRunningCommandSubmissionMode::QueueUntilCommandCompletes
         && active_block.is_agent_in_control()
         && active_block.is_agent_requested_command()
         && active_block.ai_conversation_id() == Some(conversation_id)
+}
+
+/// Whether local prompts may be steered into the agent's current turn.
+pub(crate) fn is_prompt_steering_enabled() -> bool {
+    FeatureFlag::AgentPromptSteering.is_enabled() && FeatureFlag::QueueSlashCommand.is_enabled()
 }
 
 #[cfg(test)]

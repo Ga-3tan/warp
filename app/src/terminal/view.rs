@@ -273,12 +273,11 @@ use crate::ai::blocklist::{
     InputConfig, InputType, InputTypeAutoDetectionSource, LegacyPassiveSuggestionsEvent,
     LegacyPassiveSuggestionsModel, MaaPassiveSuggestionsEvent, MaaPassiveSuggestionsModel,
     PRE_REWIND_PREFIX, PassiveSuggestionsModels, PendingAttachment, PendingQueryState, QueuedQuery,
-    QueuedQueryId, QueuedQueryModel, QueuedQueryOrigin, QueuedQueryTiming,
-    RequestFileEditsFormatKind, ShellCommandExecutor, ShellCommandExecutorEvent,
-    ShellRecoveryResult, SlashCommandRequest, StartAgentExecutor, StartAgentExecutorEvent,
-    StartAgentRequest, ai_brand_color, block_context_from_terminal_model,
-    get_ai_block_overflow_menu_element_position_id, get_attached_blocks_chip_element_position_id,
-    is_lrc_auto_queue_active,
+    QueuedQueryId, QueuedQueryModel, QueuedQueryOrigin, RequestFileEditsFormatKind,
+    ShellCommandExecutor, ShellCommandExecutorEvent, ShellRecoveryResult, SlashCommandRequest,
+    StartAgentExecutor, StartAgentExecutorEvent, StartAgentRequest, ai_brand_color,
+    block_context_from_terminal_model, get_ai_block_overflow_menu_element_position_id,
+    get_attached_blocks_chip_element_position_id, is_lrc_auto_queue_active,
 };
 use crate::ai::conversation_details_panel::ConversationDetailsPanelEvent;
 use crate::ai::conversation_utils;
@@ -5559,16 +5558,8 @@ impl TerminalView {
             .ai_context_model
             .as_ref(ctx)
             .selected_conversation_id(ctx)?;
-        let timing = self
-            .input
-            .as_ref(ctx)
-            .local_queued_prompt_timing(conversation_id, ctx);
         let id = QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
-            model.append(
-                conversation_id,
-                QueuedQuery::new(prompt, origin).with_timing(timing),
-                ctx,
-            )
+            model.append(conversation_id, QueuedQuery::new(prompt, origin), ctx)
         });
         self.maybe_dispatch_steering_prompt_now(conversation_id, ctx);
         Some(id)
@@ -5595,18 +5586,13 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) {
         if FeatureFlag::QueuedPromptsV2.is_enabled() {
-            let timing = self
-                .input
-                .as_ref(ctx)
-                .local_queued_prompt_timing(conversation_id, ctx);
             let attachments = self.ai_context_model.update(ctx, |context_model, ctx| {
                 context_model.take_pending_attachments(ctx)
             });
             QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
                 model.append(
                     conversation_id,
-                    QueuedQuery::new_with_attachments(prompt, origin, attachments)
-                        .with_timing(timing),
+                    QueuedQuery::new_with_attachments(prompt, origin, attachments),
                     ctx,
                 );
             });
@@ -5636,10 +5622,11 @@ impl TerminalView {
         if self
             .ai_controller
             .as_ref(ctx)
-            .can_dispatch_queued_warp_agent_prompt(conversation_id, ctx)
+            .has_active_stream_for_conversation(conversation_id, ctx)
         {
-            self.drain_queued_prompts(conversation_id, FinishReason::Complete, ctx);
+            return;
         }
+        self.drain_queued_prompts(conversation_id, FinishReason::Complete, ctx);
     }
 
     /// Drains one prompt from the queued-query singleton for `conversation_id` when that
@@ -5671,11 +5658,14 @@ impl TerminalView {
                             .queue(conversation_id)
                             .iter()
                             .any(|row| {
-                                row.id() == query_id
-                                    && (row.timing() == QueuedQueryTiming::NextTurn
-                                        || row.shared_session_prompt().is_some())
+                                row.id() == query_id && row.shared_session_prompt().is_some()
                             })
                         {
+                            // Shared-session injections are normally dispatched via `Steering`'s
+                            // piggyback-on-next-request mechanism, or immediately when queued
+                            // while idle; reaching one here means neither applied (e.g. a prior
+                            // dispatch was deferred because a CLI subagent was active), so try
+                            // dispatching the head row now that this turn finished.
                             self.ai_controller.update(ctx, |controller, ctx| {
                                 controller.dispatch_queued_warp_agent_prompt(
                                     conversation_id,

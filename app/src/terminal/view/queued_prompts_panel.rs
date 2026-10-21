@@ -37,7 +37,7 @@ use crate::ai::blocklist::agent_view::shortcuts::render_keystroke_with_color_ove
 use crate::ai::blocklist::block::cli_controller::{CLISubagentController, CLISubagentEvent};
 use crate::ai::blocklist::{
     BlocklistAIHistoryEvent, BlocklistAIHistoryModel, QueuedQueryEvent, QueuedQueryId,
-    QueuedQueryModel, QueuedQueryOrigin, QueuedQueryTiming,
+    QueuedQueryModel, QueuedQueryOrigin,
 };
 use crate::appearance::Appearance;
 use crate::editor::{
@@ -65,6 +65,9 @@ const SEND_NOW_AS_READ_ONLY_VIEWER_TOOLTIP: &str = "Read-only viewers cannot sen
 /// Suffix on rows auto-queued during an agent-requested long-running command, which fire
 /// when that command completes rather than at the end of the full response.
 const LRC_AUTO_QUEUE_ROW_SUFFIX: &str = "(queued until the command finishes)";
+/// Suffix on rows filed in `Steer` mode, which fire at the agent's next request boundary rather
+/// than at the end of the full response.
+const LOCAL_STEERING_ROW_SUFFIX: &str = "(next turn)";
 
 /// Returns the position-cache id used to look up a row's bounding rect during a drag.
 /// Indexed by the row's current visual index so swaps maintain stable lookups.
@@ -948,7 +951,6 @@ impl View for QueuedPromptsPanelView {
                         panel_view_id,
                         index,
                         origin: query.origin(),
-                        timing: query.timing(),
                         is_command: query.is_command(),
                         is_in_edit_mode,
                         is_being_dragged,
@@ -1122,7 +1124,6 @@ struct RenderRowProps<'a> {
     panel_view_id: EntityId,
     index: usize,
     origin: QueuedQueryOrigin,
-    timing: QueuedQueryTiming,
     /// Whether this row is a shell command (rendered with a blue `!` prefix) vs an agent prompt.
     is_command: bool,
     is_in_edit_mode: bool,
@@ -1140,7 +1141,6 @@ fn render_row(props: RenderRowProps<'_>, app: &AppContext) -> Box<dyn Element> {
         panel_view_id,
         index,
         origin,
-        timing,
         is_command,
         is_in_edit_mode,
         is_being_dragged,
@@ -1234,17 +1234,18 @@ fn render_row(props: RenderRowProps<'_>, app: &AppContext) -> Box<dyn Element> {
         } else {
             prompt_text_or_editor
         };
-        let suffix = if matches!(
-            origin,
-            QueuedQueryOrigin::LrcAutoQueue | QueuedQueryOrigin::PendingLrcAutoQueue
-        ) {
-            Some(LRC_AUTO_QUEUE_ROW_SUFFIX)
-        } else {
-            match timing {
-                QueuedQueryTiming::NextTurn => Some("(next turn)"),
-                QueuedQueryTiming::AfterResponse => Some("(after response)"),
-                QueuedQueryTiming::InheritConversation => None,
+        // An italic suffix explains when rows that don't simply fire after the response will go.
+        let suffix = match origin {
+            QueuedQueryOrigin::LrcAutoQueue | QueuedQueryOrigin::PendingLrcAutoQueue => {
+                Some(LRC_AUTO_QUEUE_ROW_SUFFIX)
             }
+            QueuedQueryOrigin::LocalSteering => Some(LOCAL_STEERING_ROW_SUFFIX),
+            QueuedQueryOrigin::InitialCloudMode
+            | QueuedQueryOrigin::SharedSessionInjection
+            | QueuedQueryOrigin::QueueSlashCommand
+            | QueuedQueryOrigin::AutoQueueToggle
+            | QueuedQueryOrigin::CompactAndSlashCommand
+            | QueuedQueryOrigin::ForkAndCompactSlashCommand => None,
         };
         let prompt_text_or_editor = if let Some(suffix) = suffix {
             let suffix_color: ColorU = theme.sub_text_color(theme.surface_1()).into();

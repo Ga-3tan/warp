@@ -50,7 +50,7 @@ fn start_injection_command(
 #[test]
 fn local_steering_uses_one_row_per_natural_tool_or_event_request() {
     use crate::ai::agent::ImageContext;
-    use crate::ai::blocklist::{PendingAttachment, QueuedQueryTiming};
+    use crate::ai::blocklist::PendingAttachment;
     for event_boundary in [false, true] {
         App::test((), move |mut app| async move {
             initialize_app_for_terminal_view(&mut app);
@@ -80,15 +80,13 @@ fn local_steering_uses_one_row_per_natural_tool_or_event_request() {
                     QueuedQuery::new(
                         "after response".into(),
                         QueuedQueryOrigin::QueueSlashCommand,
-                    )
-                    .with_timing(QueuedQueryTiming::AfterResponse),
+                    ),
                     ctx,
                 );
                 for prompt in ["first correction", "second correction"] {
                     queue.append(
                         id,
-                        QueuedQuery::new(prompt.into(), QueuedQueryOrigin::LocalSteering)
-                            .with_timing(QueuedQueryTiming::NextTurn),
+                        QueuedQuery::new(prompt.into(), QueuedQueryOrigin::LocalSteering),
                         ctx,
                     );
                 }
@@ -187,25 +185,16 @@ fn local_steering_uses_one_row_per_natural_tool_or_event_request() {
 }
 
 #[test]
-fn local_steering_waits_for_clean_idle_and_keeps_the_row_until_acceptance() {
-    use crate::ai::blocklist::QueuedQueryTiming;
+fn local_steering_row_filed_while_idle_dispatches_only_from_a_clean_idle_state() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let terminal = add_window_with_terminal(&mut app, None);
         let controller = terminal.read(&app, |view, _| view.ai_controller().clone());
-        let id = controller.update(&mut app, |controller, ctx| {
+        let (id, task_id, streams) = controller.update(&mut app, |controller, ctx| {
             let id = BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
                 history.start_new_conversation(terminal.id(), false, false, false, ctx)
             });
             controller.send_user_query_in_conversation("initial".into(), id, None, ctx);
-            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
-                queue.append(
-                    id,
-                    QueuedQuery::new("correction".into(), QueuedQueryOrigin::LocalSteering)
-                        .with_timing(QueuedQueryTiming::NextTurn),
-                    ctx,
-                );
-            });
             let task_id = BlocklistAIHistoryModel::as_ref(ctx)
                 .conversation(&id)
                 .unwrap()
@@ -214,12 +203,24 @@ fn local_steering_waits_for_clean_idle_and_keeps_the_row_until_acceptance() {
             let streams = controller
                 .in_flight_response_streams
                 .stream_ids_for_conversation(id, ctx);
-            assert!(
-                controller
-                    .steer_head_prompt_for_request(id, &task_id, true, ctx)
-                    .is_some()
-            );
-            controller.dispatch_queued_warp_agent_prompt(id, None, ctx);
+            (id, task_id, streams)
+        });
+        let file_steering_row = |app: &mut App| {
+            QueuedQueryModel::handle(app).update(app, |queue, ctx| {
+                if let Some(row) = queue.pop_front(id, ctx) {
+                    queue.append(id, row, ctx);
+                } else {
+                    queue.append(
+                        id,
+                        QueuedQuery::new("correction".into(), QueuedQueryOrigin::LocalSteering),
+                        ctx,
+                    );
+                }
+            });
+        };
+        // Mid-turn with a live stream: the row waits for a request boundary.
+        file_steering_row(&mut app);
+        controller.update(&mut app, |controller, ctx| {
             assert_eq!(
                 controller
                     .in_flight_response_streams
@@ -227,41 +228,43 @@ fn local_steering_waits_for_clean_idle_and_keeps_the_row_until_acceptance() {
                 streams
             );
             assert_eq!(QueuedQueryModel::as_ref(ctx).queue(id).len(), 1);
-            for stream in streams {
-                controller
-                    .in_flight_response_streams
-                    .cleanup_stream(&stream);
+            for stream in &streams {
+                controller.in_flight_response_streams.cleanup_stream(stream);
             }
-            for status in [
-                ConversationStatus::InProgress,
-                ConversationStatus::Error,
-                ConversationStatus::TransientError,
-                ConversationStatus::Cancelled,
-            ] {
-                BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
-                    history
-                        .conversation_mut(&id)
-                        .unwrap()
-                        .set_status_for_test(status)
-                });
-                controller.dispatch_queued_warp_agent_prompt(id, None, ctx);
-                assert_eq!(QueuedQueryModel::as_ref(ctx).queue(id).len(), 1);
-            }
+        });
+        for status in [
+            ConversationStatus::InProgress,
+            ConversationStatus::Error,
+            ConversationStatus::TransientError,
+            ConversationStatus::Cancelled,
+        ] {
+            BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, _| {
+                history
+                    .conversation_mut(&id)
+                    .unwrap()
+                    .set_status_for_test(status)
+            });
+            file_steering_row(&mut app);
+            QueuedQueryModel::handle(&app).read(&app, |queue, _| {
+                assert_eq!(queue.queue(id).len(), 1);
+            });
+        }
+        controller.update(&mut app, |controller, ctx| {
             assert!(
                 controller
                     .steer_head_prompt_for_request(id, &task_id, true, ctx)
                     .is_none()
             );
-            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
-                history
-                    .conversation_mut(&id)
-                    .unwrap()
-                    .set_status_for_test(ConversationStatus::Success)
-            });
-            let _flag_off = FeatureFlag::AgentPromptSteering.override_enabled(false);
-            controller.dispatch_queued_warp_agent_prompt(id, None, ctx);
-            assert!(!QueuedQueryModel::as_ref(ctx).has_queue(id));
-            id
+        });
+        BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, _| {
+            history
+                .conversation_mut(&id)
+                .unwrap()
+                .set_status_for_test(ConversationStatus::Success)
+        });
+        file_steering_row(&mut app);
+        QueuedQueryModel::handle(&app).read(&app, |queue, _| {
+            assert!(!queue.has_queue(id));
         });
         BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| {
             assert_eq!(
@@ -559,12 +562,8 @@ fn injection_interrupt_falls_back_after_grace_without_waiting_for_command_result
             controller.terminal_model.lock().finish_block();
             assert!(
                 matches!(controller.steer_head_prompt_for_request(id, &task_id, false, ctx),
-                Some((AIAgentInput::UserQuery { query, .. }, _)) if query == "followup")
+                Some(AIAgentInput::UserQuery { query, .. }) if query == "followup")
             );
-            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
-                let row_id = queue.ready_head(id).unwrap().id();
-                queue.remove_fired_row(id, row_id, ctx);
-            });
             assert!(
                 controller
                     .steer_head_prompt_for_request(id, &task_id, false, ctx)
@@ -591,7 +590,7 @@ fn injection_interrupt_falls_back_after_grace_without_waiting_for_command_result
         controller.update(&mut app, |controller, ctx| {
             assert!(
                 matches!(controller.steer_head_prompt_for_request(id, &task_id, false, ctx),
-                Some((AIAgentInput::UserQuery { query, .. }, _)) if query == "second followup")
+                Some(AIAgentInput::UserQuery { query, .. }) if query == "second followup")
             );
         });
         assert_eq!(*interrupts.borrow(), 1);
@@ -739,7 +738,7 @@ fn injection_exit_prompt_is_skipped_when_the_pty_interrupt_finished_the_command(
             assert_eq!(user_queries_in_order(history, id), vec!["initial"]);
             assert!(matches!(
                 controller.steer_head_prompt_for_request(id, &task_id, false, ctx),
-                Some((AIAgentInput::UserQuery { query, .. }, _)) if query == "followup"
+                Some(AIAgentInput::UserQuery { query, .. }) if query == "followup"
             ));
         });
     });
@@ -946,8 +945,7 @@ fn prepared_file_prompt_steers_without_interrupting_or_redownloading() {
             assert_eq!(controller.in_flight_response_streams.stream_ids_for_conversation(id, ctx), streams);
             let task_id = BlocklistAIHistoryModel::as_ref(ctx)
                 .conversation(&id).unwrap().get_root_task_id().clone();
-            let (input, accepted_id) = controller.steer_head_prompt_for_request(id, &task_id, false, ctx).unwrap();
-            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| queue.remove_fired_row(id, accepted_id, ctx));
+            let input = controller.steer_head_prompt_for_request(id, &task_id, false, ctx).unwrap();
             let AIAgentInput::UserQuery { query, referenced_attachments, base: input_base, .. } = &input else {
                 panic!("expected a user query");
             };

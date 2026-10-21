@@ -25,7 +25,7 @@ use crate::ai::blocklist::block::FinishReason;
 use crate::ai::blocklist::{
     AutofireAction, BlocklistAIControllerEvent, BlocklistAIHistoryEvent, BlocklistAIHistoryModel,
     ConversationStatusUpdate, PendingAttachment, QueuedQuery, QueuedQueryId, QueuedQueryModel,
-    QueuedQueryOrigin, QueuedQueryTiming, ResponseStreamId,
+    QueuedQueryOrigin, ResponseStreamId,
 };
 use crate::features::FeatureFlag;
 use crate::search::slash_command_menu::static_commands::commands;
@@ -225,13 +225,12 @@ fn mixed_queue_with_long_preview_and_inline_editor_lays_out() {
         let edited = QueuedQueryModel::handle(&app).update(&mut app, |queue, ctx| {
             queue.append(
                 id,
-                user_query(&"long preview ".repeat(100))
-                    .with_timing(QueuedQueryTiming::AfterResponse),
+                QueuedQuery::new("long preview ".repeat(100), QueuedQueryOrigin::LrcAutoQueue),
                 ctx,
             );
             queue.append(
                 id,
-                user_query("correction").with_timing(QueuedQueryTiming::NextTurn),
+                QueuedQuery::new("correction".into(), QueuedQueryOrigin::LocalSteering),
                 ctx,
             )
         });

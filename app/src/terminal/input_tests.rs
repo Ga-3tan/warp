@@ -2654,15 +2654,15 @@ fn local_steering_captures_attachments_without_changing_full_response_queueing()
     App::test((), |mut app| async move {
         let _agent_view = FeatureFlag::AgentView.override_enabled(false);
         let _queue = FeatureFlag::QueueSlashCommand.override_enabled(true);
-        let steering = FeatureFlag::AgentPromptSteering.override_enabled(true);
+        let _steering = FeatureFlag::AgentPromptSteering.override_enabled(true);
         initialize_app(&mut app);
         let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
         let id = seed_in_progress_conversation(&mut app, &terminal);
         select_conversation(&mut app, &terminal, id);
         AISettings::handle(&app).update(&mut app, |settings, ctx| {
             settings
-                .unqueued_prompt_behavior
-                .set_value(UnqueuedPromptBehavior::Steer, ctx)
+                .default_prompt_submission_mode
+                .set_value(PromptSubmissionMode::Steer, ctx)
                 .unwrap();
         });
         let input = terminal.read(&app, |view, _| view.input().clone());
@@ -2700,8 +2700,8 @@ fn local_steering_captures_attachments_without_changing_full_response_queueing()
             );
             let queue = QueuedQueryModel::as_ref(ctx).queue(id);
             assert_eq!(queue.len(), 2);
-            assert_eq!(queue[0].timing(), QueuedQueryTiming::AfterResponse);
-            assert_eq!(queue[1].timing(), QueuedQueryTiming::NextTurn);
+            assert_eq!(queue[0].origin(), QueuedQueryOrigin::QueueSlashCommand);
+            assert_eq!(queue[1].origin(), QueuedQueryOrigin::LocalSteering);
             assert_eq!(queue[1].attachments().len(), 1);
             assert_eq!(
                 BlocklistAIHistoryModel::as_ref(ctx)
@@ -2710,16 +2710,15 @@ fn local_steering_captures_attachments_without_changing_full_response_queueing()
                     .status(),
                 &ConversationStatus::InProgress
             );
-        });
-        drop(steering);
-        AISettings::handle(&app).update(&mut app, |settings, ctx| {
-            settings
-                .unqueued_prompt_behavior
-                .set_value(UnqueuedPromptBehavior::Interrupt, ctx)
-                .unwrap();
-        });
-        QueuedQueryModel::handle(&app).read(&app, |queue, _| {
-            assert_eq!(queue.queue(id)[1].timing(), QueuedQueryTiming::NextTurn);
+            // The auto-queue chip overrides Steer for this conversation.
+            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
+                queue.toggle_queue_next_prompt(id, ctx);
+            });
+            input.replace_buffer_content("queued instead", ctx);
+            input.input_enter(ctx);
+            let queue = QueuedQueryModel::as_ref(ctx).queue(id);
+            assert_eq!(queue.len(), 3);
+            assert_eq!(queue[2].origin(), QueuedQueryOrigin::AutoQueueToggle);
         });
     });
 }
@@ -2742,8 +2741,8 @@ fn local_steering_does_not_capture_interrupt_slash_idle_or_external_prompts() {
         });
         AISettings::handle(&app).update(&mut app, |settings, ctx| {
             settings
-                .unqueued_prompt_behavior
-                .set_value(UnqueuedPromptBehavior::Steer, ctx)
+                .default_prompt_submission_mode
+                .set_value(PromptSubmissionMode::Steer, ctx)
                 .unwrap();
         });
         {
