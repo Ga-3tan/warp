@@ -1,7 +1,7 @@
 # Desktop execution-host selection: technical design
 ## Context
-Implement the numbered behaviors in [PRODUCT.md](PRODUCT.md). This is a proposed fix,
-not an implementation or an incident-confirmed reproduction.
+Implement the numbered behaviors in [PRODUCT.md](PRODUCT.md). This fixes the traced
+client state mismatch; it is not an incident-confirmed customer reproduction.
 Source evidence at client revision `c10fc07d74faa400dc527ed747b30fcb44928772`:
 - [`host_selector.rs (159-254)`](https://github.com/warpdotdev/warp/blob/c10fc07d74faa400dc527ed747b30fcb44928772/app/src/terminal/view/ambient_agent/host_selector.rs#L159-L254)
   restores `CloudAgentSettings.last_selected_host` into `selected`. Default updates
@@ -20,7 +20,7 @@ can fill an absent host from workspace defaults after execution-principal defaul
 An unresolved empty host becomes Warp-hosted in
 [`worker_routing.go (61-100)`](https://github.com/warpdotdev/warp-server/blob/a4522bfa2781ba067f77b4dc2e00181f44d270dd/logic/ai/ambient_agents/sources/worker_routing.go#L61-L100).
 An ordinary explicit self-hosted slug is not this empty-host case.
-## Proposed changes
+## Implementation
 ### Authoritative pane-local selection
 Keep selection resolution in `HostSelector`; do not add a new shared global model.
 Represent an optional explicit choice separately from the existing configured default.
@@ -86,14 +86,15 @@ belongs to normal CI; a full local presubmit is not required by this spec.
 Use `cargo nextest run -p warp --lib --features local_tty,local_fs` with a filter for
 the new host-selection regressions and the existing attachment/host-selector tests.
 Run `cargo clippy -p warp --all-targets --tests --features local_tty,local_fs -- -D warnings`,
-then the applicable repository formatter. These are future implementation checks,
-not results claimed by this spec-only change.
+then the applicable repository formatter. Record the results in the implementation PR.
 Customer confirmation still needs the desktop OS/channel/build, affected and working
 run IDs, and whether each was a fresh launch. Compare the sanitized request host,
 persisted snapshot, resolved worker kind/slug, and execution location before and after
-reselection. No UI reproduction or customer-run log inspection has been performed.
-Computer-use verification is a separate human choice before implementation; do not
-treat this spec request as authorization to operate a running interface.
+reselection. Customer-run log inspection is outside this implementation's scope.
+Computer-use verification of the fixed desktop build and automated regression tests
+were explicitly approved for implementation verification. Capture the restored
+selection and a fresh launch's requested routing where the verification environment
+permits it; distinguish controlled fixtures from a real self-hosted backend.
 ## Parallelization
 Use one implementation workstream after approval. Selector provenance, input wiring,
 and regression fixtures are tightly coupled; parallel authors would add coordination
