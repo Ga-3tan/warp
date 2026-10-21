@@ -127,7 +127,7 @@ pub(crate) fn add(params: CustomEndpointParams, ctx: &mut AppContext) -> anyhow:
     let mut definitions = AISettings::as_ref(ctx).custom_endpoints.value().clone();
     let id = CustomEndpointId::generated();
     let key = params.api_key.clone();
-    definitions.insert(id.clone(), definition_from_params(params))?;
+    definitions.insert(id.clone(), definition_from_params(params, None))?;
     ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
         manager.persist_custom_endpoint_key(id.clone(), Some(key), ctx)
     })?;
@@ -151,7 +151,8 @@ pub(crate) fn save(
         .id_at(index)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("custom endpoint index is out of bounds"))?;
-    definitions.insert(id.clone(), definition_from_params(params.clone()))?;
+    let definition = definition_from_params(params.clone(), definitions.get(&id));
+    definitions.insert(id.clone(), definition)?;
     let old_key = ApiKeyManager::as_ref(ctx)
         .custom_endpoint_key(&id)
         .map(ToOwned::to_owned);
@@ -183,7 +184,10 @@ pub(crate) fn remove(index: usize, ctx: &mut AppContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn definition_from_params(params: CustomEndpointParams) -> CustomEndpointDefinition {
+fn definition_from_params(
+    params: CustomEndpointParams,
+    saved: Option<&CustomEndpointDefinition>,
+) -> CustomEndpointDefinition {
     CustomEndpointDefinition {
         name: params.name,
         base_url: params.url,
@@ -194,6 +198,11 @@ fn definition_from_params(params: CustomEndpointParams) -> CustomEndpointDefinit
             .map(|(name, alias, config_key)| CustomEndpointModel {
                 name,
                 alias,
+                computer_use_toolset: config_key
+                    .as_ref()
+                    .and_then(|key| saved?.models.iter().find(|model| model.config_key == *key))
+                    .map(|model| model.computer_use_toolset)
+                    .unwrap_or_default(),
                 config_key: config_key
                     .filter(|key| !key.trim().is_empty())
                     .unwrap_or_else(|| Uuid::new_v4().to_string()),

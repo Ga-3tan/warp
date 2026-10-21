@@ -1232,23 +1232,20 @@ impl LLMPreferences {
             .iter()
     }
 
-    /// Returns the `LLMInfo` for the computer use agent model.
-    pub fn get_active_computer_use_model<'a>(
-        &'a self,
+    /// Returns the explicit computer-use selection without substituting an unavailable model.
+    pub fn computer_use_model_id_for_request(
+        &self,
         scope: &(impl TeamScope + ?Sized),
-        app: &'a AppContext,
+        app: &AppContext,
         terminal_view_id: Option<EntityId>,
-    ) -> &'a LLMInfo {
+    ) -> LLMId {
         let profile = AIExecutionProfilesModel::as_ref(app).active_profile(terminal_view_id, app);
-
-        let available = self.get_computer_use_available(scope.team_uid(), app);
-        let selected_model = terminal_view_id
+        terminal_view_id
             .and_then(|id| self.computer_use_llm_for_terminal_view.get(&id))
             .map(Option::as_ref)
-            .unwrap_or_else(|| profile.data().computer_use_model.as_ref());
-        selected_model
-            .and_then(|id| available.info_for_id(id))
-            .unwrap_or_else(|| self.get_default_computer_use_model(scope, app))
+            .unwrap_or_else(|| profile.data().computer_use_model.as_ref())
+            .cloned()
+            .unwrap_or_else(|| self.get_default_computer_use_model(scope, app).id.clone())
     }
 
     /// Returns the effective default computer use model as a fallback: the

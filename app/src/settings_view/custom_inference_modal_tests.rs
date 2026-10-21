@@ -19,6 +19,7 @@ fn endpoint_with_models(model_count: usize) -> CustomEndpoint {
                 name: format!("model-{index}"),
                 alias: None,
                 config_key: format!("config-{index}"),
+                computer_use_toolset: Default::default(),
             })
             .collect(),
     }

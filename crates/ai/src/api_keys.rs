@@ -418,6 +418,37 @@ pub struct CustomEndpointModel {
     /// as the `CustomModelProviders.providers[*].models[*].config_key` on the request wire.
     /// Generated as a UUIDv4 at model creation.
     pub config_key: String,
+    pub computer_use_toolset: ComputerUseToolset,
+}
+
+/// Native computer-use contract declared by a custom endpoint model.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerUseToolset {
+    #[default]
+    None,
+    #[serde(rename = "anthropic_computer_20250124")]
+    AnthropicComputer20250124,
+    #[serde(rename = "anthropic_computer_20251124")]
+    AnthropicComputer20251124,
+    #[serde(rename = "anthropic_computer_toolset_20260801")]
+    AnthropicComputerToolset20260801,
+    OpenaiResponsesComputerTool,
+}
+
+impl ComputerUseToolset {
+    fn to_proto(self) -> api::request::settings::custom_model_providers::ComputerUseToolset {
+        use api::request::settings::custom_model_providers::ComputerUseToolset as Proto;
+        match self {
+            Self::None => Proto::None,
+            Self::AnthropicComputer20250124 => Proto::AnthropicComputer20250124,
+            Self::AnthropicComputer20251124 => Proto::AnthropicComputer20251124,
+            Self::AnthropicComputerToolset20260801 => Proto::AnthropicComputerToolset20260801,
+            Self::OpenaiResponsesComputerTool => Proto::OpenaiResponsesComputerTool,
+        }
+    }
 }
 
 impl CustomEndpointModel {
@@ -1012,6 +1043,7 @@ impl ApiKeyManager {
                     config_key: config_key
                         .filter(|k| !k.is_empty())
                         .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                    computer_use_toolset: ComputerUseToolset::None,
                 })
                 .collect(),
         });
@@ -1038,6 +1070,11 @@ impl ApiKeyManager {
             models,
             schema,
         } = params;
+        let saved_toolsets: HashMap<_, _> = self.keys.custom_endpoints[index]
+            .models
+            .iter()
+            .map(|model| (model.config_key.clone(), model.computer_use_toolset))
+            .collect();
         self.keys.custom_endpoints[index] = CustomEndpoint {
             name,
             url,
@@ -1048,6 +1085,11 @@ impl ApiKeyManager {
                 .map(|(name, alias, config_key)| CustomEndpointModel {
                     name,
                     alias,
+                    computer_use_toolset: config_key
+                        .as_ref()
+                        .and_then(|key| saved_toolsets.get(key))
+                        .copied()
+                        .unwrap_or_default(),
                     config_key: config_key
                         .filter(|k| !k.is_empty())
                         .unwrap_or_else(|| Uuid::new_v4().to_string()),
@@ -1149,6 +1191,7 @@ impl ApiKeyManager {
                                 slug: m.name.clone(),
                                 config_key: m.config_key.clone(),
                                 reasoning_effort: String::new(),
+                                computer_use_toolset: m.computer_use_toolset.to_proto() as i32,
                             },
                         )
                         .collect(),

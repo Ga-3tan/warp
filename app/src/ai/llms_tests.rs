@@ -324,6 +324,7 @@ fn model(name: &str, alias: Option<&str>, config_key: &str) -> CustomEndpointMod
         name: name.into(),
         alias: alias.map(|s| s.into()),
         config_key: config_key.into(),
+        computer_use_toolset: Default::default(),
     }
 }
 
@@ -1421,12 +1422,11 @@ fn computer_use_model_override_takes_precedence_over_the_profile() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .get_active_computer_use_model(
+                    .computer_use_model_id_for_request(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
-                    .id
                     .as_str(),
                 "computer-use-model"
             );
@@ -1456,12 +1456,11 @@ fn computer_use_default_override_ignores_the_profile_model() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .get_active_computer_use_model(
+                    .computer_use_model_id_for_request(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
-                    .id
                     .as_str(),
                 "computer-use-agent-auto"
             );
@@ -1487,12 +1486,11 @@ fn computer_use_model_falls_back_to_the_profile_without_a_terminal_override() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .get_active_computer_use_model(
+                    .computer_use_model_id_for_request(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
-                    .id
                     .as_str(),
                 "profile-model"
             );
@@ -1526,12 +1524,11 @@ fn clearing_computer_use_model_override_restores_the_profile_model() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .get_active_computer_use_model(
+                    .computer_use_model_id_for_request(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
-                    .id
                     .as_str(),
                 "profile-model"
             );
@@ -1541,7 +1538,7 @@ fn clearing_computer_use_model_override_restores_the_profile_model() {
 
 #[cfg(not(target_family = "wasm"))]
 #[test]
-fn computer_use_model_override_falls_back_to_default_for_an_unknown_model() {
+fn computer_use_request_preserves_an_unavailable_explicit_model() {
     with_computer_use_test_context(|app| {
         let preferences = LLMPreferences::handle(app);
         let terminal_view_id = EntityId::new();
@@ -1554,14 +1551,13 @@ fn computer_use_model_override_falls_back_to_default_for_an_unknown_model() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .get_active_computer_use_model(
+                    .computer_use_model_id_for_request(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
-                    .id
                     .as_str(),
-                "computer-use-agent-auto"
+                "unknown-model"
             );
         });
     });
@@ -1591,12 +1587,11 @@ fn resetting_session_model_overrides_restores_the_computer_use_profile_model() {
         preferences.read(app, |preferences, ctx| {
             assert_eq!(
                 preferences
-                    .get_active_computer_use_model(
+                    .computer_use_model_id_for_request(
                         &TeamlessScopeForTest,
                         ctx,
                         Some(terminal_view_id)
                     )
-                    .id
                     .as_str(),
                 "profile-model"
             );

@@ -8,6 +8,45 @@ use warpui_extras::secure_storage;
 
 use super::*;
 use crate::settings::init_and_register_user_preferences;
+#[test]
+fn endpoint_edits_preserve_toolsets_by_stable_model_key() {
+    let saved = CustomEndpointDefinition {
+        name: "Gateway".into(),
+        base_url: "https://gateway.example/v1".into(),
+        schema: CustomEndpointSchema::AnthropicMessages,
+        models: vec![CustomEndpointModel {
+            name: "model".into(),
+            config_key: "pinned-key".into(),
+            computer_use_toolset: ai::api_keys::ComputerUseToolset::AnthropicComputer20251124,
+            ..Default::default()
+        }],
+    };
+    let edited = definition_from_params(
+        CustomEndpointParams {
+            name: "Renamed gateway".into(),
+            url: saved.base_url.clone(),
+            api_key: "rotated-key".into(),
+            schema: saved.schema,
+            models: vec![
+                (
+                    "model".into(),
+                    Some("Alias".into()),
+                    Some("pinned-key".into()),
+                ),
+                ("new".into(), None, None),
+            ],
+        },
+        Some(&saved),
+    );
+    assert_eq!(
+        edited.models[0].computer_use_toolset,
+        saved.models[0].computer_use_toolset
+    );
+    assert_eq!(
+        edited.models[1].computer_use_toolset,
+        ai::api_keys::ComputerUseToolset::None
+    );
+}
 
 struct FailingSecureStorage {
     write_attempts: Rc<Cell<usize>>,
@@ -57,6 +96,7 @@ fn removal_succeeds_when_credential_cleanup_fails() {
                         name: "model".to_owned(),
                         alias: None,
                         config_key: "config-key".to_owned(),
+                        computer_use_toolset: Default::default(),
                     }],
                 },
             )
