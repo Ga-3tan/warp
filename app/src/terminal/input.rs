@@ -14933,10 +14933,9 @@ impl Input {
     ) -> QueuedQueryTiming {
         if FeatureFlag::AgentPromptSteering.is_enabled()
             && FeatureFlag::QueueSlashCommand.is_enabled()
-            && self
-                .ai_controller
-                .as_ref(ctx)
-                .is_local_native_prompt_target(conversation_id, ctx)
+            && BlocklistAIHistoryModel::as_ref(ctx)
+                .conversation(&conversation_id)
+                .is_some_and(|conversation| conversation.driver().owns_turn_lifecycle())
             && self.ambient_agent_task_id(ctx).is_none()
             && resolve_ai_query_routing(
                 self.terminal_view_id,
@@ -14979,17 +14978,14 @@ impl Input {
         else {
             return false;
         };
-        if !self
-            .ai_controller
-            .as_ref(ctx)
-            .is_local_native_prompt_target(conversation_id, ctx)
-            || !BlocklistAIHistoryModel::as_ref(ctx)
-                .conversation(&conversation_id)
-                .is_some_and(|c| {
-                    !c.is_empty()
-                        && !c.is_summarizing()
-                        && (c.status().is_in_progress() || c.status().is_blocked())
-                })
+        if !BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .is_some_and(|c| {
+                c.driver().owns_turn_lifecycle()
+                    && !c.is_empty()
+                    && !c.is_summarizing()
+                    && (c.status().is_in_progress() || c.status().is_blocked())
+            })
             || QueuedQueryModel::as_ref(ctx).is_dispatch_blocked(conversation_id)
             || QueuedQueryModel::as_ref(ctx).has_command_in_flight(conversation_id)
         {

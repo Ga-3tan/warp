@@ -5,9 +5,9 @@ use warp_core::features::FeatureFlag;
 use warp_errors::report_error;
 use warpui::{ModelContext, SingletonEntity};
 
-use super::BlocklistAIController;
 use super::external_harness::ExternalHarnessPrompt;
 use super::shared_session::SharedSessionPromptTarget;
+use super::{BlocklistAIController, RecoveryBudget, RequestInput};
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::{AIAgentAttachment, BaseUserQuery};
 use crate::ai::attachment_utils::{
@@ -16,9 +16,11 @@ use crate::ai::attachment_utils::{
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::blocklist::orchestration_events::OrchestrationEventService;
 use crate::ai::blocklist::{
-    BlocklistAIHistoryModel, QueuedPromptDeliveryMode, QueuedQuery, QueuedQueryId, QueuedQueryModel,
+    BlocklistAIHistoryModel, QueuedPromptDeliveryMode, QueuedQuery, QueuedQueryId,
+    QueuedQueryModel, QueuedQueryTiming,
 };
 use crate::server::server_api::ServerApiProvider;
+use crate::workspaces::user_workspaces::ResolvedTeamScope;
 
 impl BlocklistAIController {
     /// Binds this controller to a native conversation before session sharing can begin
@@ -220,17 +222,50 @@ impl BlocklistAIController {
         let Some(row) = row else {
             return;
         };
+        let is_automatic_steering =
+            query_id.is_none() && row.timing() == QueuedQueryTiming::NextTurn;
+        if is_automatic_steering
+            && !self.can_dispatch_queued_warp_agent_prompt(conversation_id, ctx)
+        {
+            return;
+        }
         let row_id = row.id();
         log::info!(
             "event=native_queue_row_dispatched task_id={:?} terminal_id={:?} conversation_id={conversation_id} query_id={row_id:?}",
             self.ambient_agent_task_id,
             self.terminal_surface_id,
         );
-        if row.shared_session_prompt().is_some() {
+        if is_automatic_steering {
+            let Some(task_id) = BlocklistAIHistoryModel::as_ref(ctx)
+                .conversation(&conversation_id)
+                .map(|conversation| conversation.get_root_task_id().clone())
+            else {
+                return;
+            };
+            let Some((input, _)) =
+                self.steer_head_prompt_for_request(conversation_id, &task_id, true, ctx)
+            else {
+                return;
+            };
+            let scope = ResolvedTeamScope::from_scope(&self.team_context(ctx));
+            let request = RequestInput::for_task(
+                vec![input],
+                task_id,
+                &self.active_session,
+                self.get_current_response_initiator(),
+                conversation_id,
+                self.terminal_surface_id,
+                &scope,
+                ctx,
+            );
+            if self
+                .send_request_input(request, None, RecoveryBudget::fresh(), true, ctx)
+                .is_err()
+            {
+                return;
+            }
+        } else if row.shared_session_prompt().is_some() {
             self.send_native_startup_injection(conversation_id, row, ctx);
-            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
-                queue.remove_fired_row(conversation_id, row_id, ctx);
-            });
         } else {
             // The send path resolves this row's attachments by id, so it must still be in the
             // queue when this is called; remove it only afterward.
@@ -241,10 +276,10 @@ impl BlocklistAIController {
                 row_id,
                 ctx,
             );
-            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
-                queue.remove_fired_row(conversation_id, row_id, ctx);
-            });
         }
+        QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
+            queue.remove_fired_row(conversation_id, row_id, ctx);
+        });
     }
 
     /// Sends a prepared shared-session prompt with its attributed context.

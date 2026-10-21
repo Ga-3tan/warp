@@ -219,7 +219,7 @@ fn local_steering_waits_for_clean_idle_and_keeps_the_row_until_acceptance() {
                     .steer_head_prompt_for_request(id, &task_id, true, ctx)
                     .is_some()
             );
-            controller.dispatch_local_steering_prompt_when_idle(id, ctx);
+            controller.dispatch_queued_warp_agent_prompt(id, None, ctx);
             assert_eq!(
                 controller
                     .in_flight_response_streams
@@ -244,7 +244,7 @@ fn local_steering_waits_for_clean_idle_and_keeps_the_row_until_acceptance() {
                         .unwrap()
                         .set_status_for_test(status)
                 });
-                controller.dispatch_local_steering_prompt_when_idle(id, ctx);
+                controller.dispatch_queued_warp_agent_prompt(id, None, ctx);
                 assert_eq!(QueuedQueryModel::as_ref(ctx).queue(id).len(), 1);
             }
             assert!(
@@ -259,7 +259,7 @@ fn local_steering_waits_for_clean_idle_and_keeps_the_row_until_acceptance() {
                     .set_status_for_test(ConversationStatus::Success)
             });
             let _flag_off = FeatureFlag::AgentPromptSteering.override_enabled(false);
-            controller.dispatch_local_steering_prompt_when_idle(id, ctx);
+            controller.dispatch_queued_warp_agent_prompt(id, None, ctx);
             assert!(!QueuedQueryModel::as_ref(ctx).has_queue(id));
             id
         });

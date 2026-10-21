@@ -686,7 +686,15 @@ impl BlocklistAIController {
                     conversation_id, ..
                 } => {
                     me.maybe_interrupt_command_for_injection(*conversation_id, ctx);
-                    me.dispatch_local_steering_prompt_when_idle(*conversation_id, ctx);
+                    let is_next_turn_head = QueuedQueryModel::as_ref(ctx)
+                        .ready_head(*conversation_id)
+                        .is_some_and(|row| row.timing() == QueuedQueryTiming::NextTurn);
+                    let owns_conversation = BlocklistAIHistoryModel::as_ref(ctx)
+                        .all_live_conversations_for_terminal_surface(me.terminal_surface_id)
+                        .any(|conversation| conversation.id() == *conversation_id);
+                    if is_next_turn_head && owns_conversation {
+                        me.dispatch_queued_warp_agent_prompt(*conversation_id, None, ctx);
+                    }
                 }
                 QueuedQueryEvent::EditEntered { .. }
                 | QueuedQueryEvent::Cleared { .. }
@@ -1864,27 +1872,28 @@ impl BlocklistAIController {
             row.timing() == QueuedQueryTiming::InheritConversation
                 && (queue.is_steering(conversation_id) || is_primary_injected_followup)
         });
-        let row = inherited_row.or_else(|| {
-            (allow_local_steering
-                && self.is_local_native_prompt_target(conversation_id, ctx)
-                && !OrchestrationEventService::as_ref(ctx).is_conversation_exiting(conversation_id)
-                && BlocklistAIHistoryModel::as_ref(ctx)
-                    .conversation(&conversation_id)
-                    .is_some_and(|conversation| {
-                        !conversation.is_summarizing()
-                            && match conversation.status() {
-                                ConversationStatus::InProgress
-                                | ConversationStatus::Success
-                                | ConversationStatus::Blocked { .. }
-                                | ConversationStatus::WaitingForEvents => true,
-                                ConversationStatus::Error
-                                | ConversationStatus::TransientError
-                                | ConversationStatus::Cancelled => false,
-                            }
-                    }))
-            .then(|| queue.ready_next_turn(conversation_id))
-            .flatten()
-        })?;
+        let row = if let Some(row) = inherited_row {
+            row
+        } else {
+            if !allow_local_steering
+                || OrchestrationEventService::as_ref(ctx).is_conversation_exiting(conversation_id)
+            {
+                return None;
+            }
+            let conversation =
+                BlocklistAIHistoryModel::as_ref(ctx).conversation(&conversation_id)?;
+            if conversation.is_summarizing()
+                || matches!(
+                    conversation.status(),
+                    ConversationStatus::Error
+                        | ConversationStatus::TransientError
+                        | ConversationStatus::Cancelled
+                )
+            {
+                return None;
+            }
+            queue.ready_next_turn(conversation_id)?
+        };
         if row.is_command() {
             return None;
         }
@@ -3294,66 +3303,6 @@ impl BlocklistAIController {
     ) -> bool {
         self.in_flight_response_streams
             .has_active_stream_for_conversation(conversation_id, app)
-    }
-
-    pub(crate) fn dispatch_local_steering_prompt_when_idle(
-        &mut self,
-        conversation_id: AIConversationId,
-        ctx: &mut ModelContext<Self>,
-    ) {
-        if !self.is_local_native_prompt_target(conversation_id, ctx)
-            || !self.can_dispatch_queued_warp_agent_prompt(conversation_id, ctx)
-            || !QueuedQueryModel::as_ref(ctx)
-                .ready_head(conversation_id)
-                .is_some_and(|row| row.timing() == QueuedQueryTiming::NextTurn)
-        {
-            return;
-        }
-        let Some(task_id) = BlocklistAIHistoryModel::as_ref(ctx)
-            .conversation(&conversation_id)
-            .map(|conversation| conversation.get_root_task_id().clone())
-        else {
-            return;
-        };
-        let Some((input, query_id)) =
-            self.steer_head_prompt_for_request(conversation_id, &task_id, true, ctx)
-        else {
-            return;
-        };
-        let scope = ResolvedTeamScope::from_scope(&self.team_context(ctx));
-        let request = RequestInput::for_task(
-            vec![input],
-            task_id,
-            &self.active_session,
-            self.get_current_response_initiator(),
-            conversation_id,
-            self.terminal_surface_id,
-            &scope,
-            ctx,
-        );
-        if self
-            .send_request_input(request, None, RecoveryBudget::fresh(), true, ctx)
-            .is_ok()
-        {
-            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
-                queue.remove_fired_row(conversation_id, query_id, ctx);
-            });
-        }
-    }
-
-    pub(crate) fn is_local_native_prompt_target(
-        &self,
-        conversation_id: AIConversationId,
-        ctx: &AppContext,
-    ) -> bool {
-        self.ambient_agent_task_id.is_none()
-            && self.native_prompt_conversation_id.is_none()
-            && BlocklistAIHistoryModel::as_ref(ctx)
-                .all_live_conversations_for_terminal_surface(self.terminal_surface_id)
-                .any(|conversation| {
-                    conversation.id() == conversation_id
-                        && conversation.driver().owns_turn_lifecycle()
-                })
     }
 
     /// Whether a fresh automatic prompt can start without interrupting ongoing work.

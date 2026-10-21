@@ -5668,29 +5668,14 @@ impl TerminalView {
                 match action {
                     Some(AutofireAction::Submit { query_id, text }) => {
                         if QueuedQueryModel::as_ref(ctx)
-                            .ready_head(conversation_id)
-                            .is_some_and(|row| {
-                                row.id() == query_id && row.timing() == QueuedQueryTiming::NextTurn
-                            })
-                        {
-                            self.ai_controller.update(ctx, |controller, ctx| {
-                                controller
-                                    .dispatch_local_steering_prompt_when_idle(conversation_id, ctx);
-                            });
-                            return;
-                        }
-                        if QueuedQueryModel::as_ref(ctx)
                             .queue(conversation_id)
                             .iter()
                             .any(|row| {
-                                row.id() == query_id && row.shared_session_prompt().is_some()
+                                row.id() == query_id
+                                    && (row.timing() == QueuedQueryTiming::NextTurn
+                                        || row.shared_session_prompt().is_some())
                             })
                         {
-                            // Shared-session injections are normally dispatched via `Steering`'s
-                            // piggyback-on-next-request mechanism, or immediately when queued
-                            // while idle; reaching one here means neither applied (e.g. a prior
-                            // dispatch was deferred because a CLI subagent was active), so try
-                            // dispatching the head row now that this turn finished.
                             self.ai_controller.update(ctx, |controller, ctx| {
                                 controller.dispatch_queued_warp_agent_prompt(
                                     conversation_id,

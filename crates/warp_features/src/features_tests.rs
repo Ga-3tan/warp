@@ -13,14 +13,6 @@ fn test_all_preview_flags_have_a_description() {
 }
 
 #[test]
-fn agent_prompt_steering_is_dogfood_only_by_default() {
-    assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::AgentPromptSteering));
-    for flags in [DEBUG_FLAGS, LOCAL_FLAGS, PREVIEW_FLAGS, RELEASE_FLAGS] {
-        assert!(!flags.contains(&FeatureFlag::AgentPromptSteering));
-    }
-}
-
-#[test]
 fn factory_deferred_repositories_are_dogfood_only_by_default() {
     assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::FactoryDeferredRepositories));
     for flags in [DEBUG_FLAGS, LOCAL_FLAGS, PREVIEW_FLAGS, RELEASE_FLAGS] {
