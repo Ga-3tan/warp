@@ -1488,14 +1488,9 @@ impl AgentDriverRunner {
                 )
                 .await?;
             if FeatureFlag::OzIdentityFederation.is_enabled() {
-                options.cloud_providers = driver::cloud_provider::load_providers(
-                    &providers,
-                    &options
-                        .task_id
-                        .ok_or(AgentDriverError::InvalidRuntimeState)?
-                        .to_string(),
-                )
-                .map_err(AgentDriverError::CloudProviderSetupFailed)?;
+                options.cloud_providers =
+                    driver::cloud_provider::load_providers(&providers, Some(&task_id.to_string()))
+                        .map_err(AgentDriverError::CloudProviderSetupFailed)?;
             }
             return Ok((options, task, conversation_id));
         }
@@ -1994,8 +1989,8 @@ impl AgentDriverRunner {
     /// [`driver::ResumeOptions::ThirdParty`]; each harness owns its server call and error
     /// mapping. Returns `None` if a third-party harness has no resume payload to surface.
     #[tracing::instrument(skip_all, err, fields(tags.cloud_agent = true, conversation_id = conversation_id))]
-    async fn load_conversation_information(
-        foreground: &ModelSpawner<Self>,
+    async fn load_conversation_information<E: Entity>(
+        foreground: &ModelSpawner<E>,
         conversation_id: String,
         harness: &HarnessKind,
     ) -> Result<Option<driver::ResumeOptions>, AgentDriverError> {
@@ -2091,12 +2086,9 @@ impl AgentDriverRunner {
             .await??;
 
         if FeatureFlag::OzIdentityFederation.is_enabled() {
-            let run_id = driver_options
-                .task_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "local".to_string());
+            let run_id = driver_options.task_id.map(|id| id.to_string());
             driver_options.cloud_providers =
-                driver::cloud_provider::load_providers(&environment.providers, &run_id)
+                driver::cloud_provider::load_providers(&environment.providers, run_id.as_deref())
                     .map_err(AgentDriverError::CloudProviderSetupFailed)?;
         }
 
